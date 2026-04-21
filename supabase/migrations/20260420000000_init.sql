@@ -1,15 +1,24 @@
 -- ============================================================
 -- tasukul-mail: 初期スキーマ
+--
+-- 方針:
+--   - taskul と同一 Supabase プロジェクトに相乗りするため、
+--     全テーブルを専用スキーマ `mail` に隔離する。
+--   - Supabase Dashboard → Project Settings → API の
+--     "Exposed schemas" に `mail` を追加すること (PostgREST から見える化)。
 -- ============================================================
 
 -- Vault 拡張 (Supabase 標準搭載、有効化のみ)
 create extension if not exists supabase_vault with schema vault;
 create extension if not exists pgcrypto;
 
+create schema if not exists mail;
+grant usage on schema mail to authenticated, service_role;
+
 -- ------------------------------------------------------------
--- mail_accounts: IMAP/SMTP アカウント
+-- mail.accounts: IMAP/SMTP アカウント
 -- ------------------------------------------------------------
-create table public.mail_accounts (
+create table mail.accounts (
   id uuid primary key default gen_random_uuid(),
   owner_id uuid not null references auth.users(id) on delete cascade,
   label text not null,                                  -- "代表", "ひかる個人"
@@ -28,14 +37,14 @@ create table public.mail_accounts (
   updated_at timestamptz not null default now()
 );
 
-create index on public.mail_accounts (owner_id);
-create index on public.mail_accounts (is_shared);
+create index on mail.accounts (owner_id);
+create index on mail.accounts (is_shared);
 
 -- ------------------------------------------------------------
--- mail_account_members: 共有アカウントのアクセス制御
+-- mail.account_members: 共有アカウントのアクセス制御
 -- ------------------------------------------------------------
-create table public.mail_account_members (
-  account_id uuid references public.mail_accounts(id) on delete cascade,
+create table mail.account_members (
+  account_id uuid references mail.accounts(id) on delete cascade,
   user_id uuid references auth.users(id) on delete cascade,
   role text not null default 'member',                  -- 'owner' | 'member'
   added_at timestamptz not null default now(),
@@ -43,11 +52,11 @@ create table public.mail_account_members (
 );
 
 -- ------------------------------------------------------------
--- mail_threads: スレッド
+-- mail.threads: スレッド
 -- ------------------------------------------------------------
-create table public.mail_threads (
+create table mail.threads (
   id uuid primary key default gen_random_uuid(),
-  account_id uuid not null references public.mail_accounts(id) on delete cascade,
+  account_id uuid not null references mail.accounts(id) on delete cascade,
   subject_normalized text,                              -- Re:/Fwd: 除去済み
   participants text[] not null default '{}',
   last_message_at timestamptz not null,
@@ -55,15 +64,15 @@ create table public.mail_threads (
   created_at timestamptz not null default now()
 );
 
-create index on public.mail_threads (account_id, last_message_at desc);
+create index on mail.threads (account_id, last_message_at desc);
 
 -- ------------------------------------------------------------
--- mail_messages: メッセージ本体
+-- mail.messages: メッセージ本体
 -- ------------------------------------------------------------
-create table public.mail_messages (
+create table mail.messages (
   id uuid primary key default gen_random_uuid(),
-  account_id uuid not null references public.mail_accounts(id) on delete cascade,
-  thread_id uuid references public.mail_threads(id) on delete set null,
+  account_id uuid not null references mail.accounts(id) on delete cascade,
+  thread_id uuid references mail.threads(id) on delete set null,
   imap_uid bigint not null,
   message_id text,                                      -- RFC822 Message-ID
   in_reply_to text,
@@ -85,29 +94,29 @@ create table public.mail_messages (
   unique (account_id, imap_uid)
 );
 
-create index on public.mail_messages (account_id, received_at desc);
-create index on public.mail_messages (thread_id, received_at);
-create index on public.mail_messages (message_id);
+create index on mail.messages (account_id, received_at desc);
+create index on mail.messages (thread_id, received_at);
+create index on mail.messages (message_id);
 
 -- ------------------------------------------------------------
--- mail_message_reads: 既読トラッキング (共有アカウント用)
+-- mail.message_reads: 既読トラッキング (共有アカウント用)
 -- 代表アドレスで「誰が読んだか」を個別記録
 -- ------------------------------------------------------------
-create table public.mail_message_reads (
-  message_id uuid references public.mail_messages(id) on delete cascade,
+create table mail.message_reads (
+  message_id uuid references mail.messages(id) on delete cascade,
   user_id uuid references auth.users(id) on delete cascade,
   read_at timestamptz not null default now(),
   primary key (message_id, user_id)
 );
 
-create index on public.mail_message_reads (user_id);
+create index on mail.message_reads (user_id);
 
 -- ------------------------------------------------------------
--- mail_attachments
+-- mail.attachments
 -- ------------------------------------------------------------
-create table public.mail_attachments (
+create table mail.attachments (
   id uuid primary key default gen_random_uuid(),
-  message_id uuid not null references public.mail_messages(id) on delete cascade,
+  message_id uuid not null references mail.messages(id) on delete cascade,
   filename text not null,
   content_type text,
   size_bytes bigint,
@@ -116,17 +125,17 @@ create table public.mail_attachments (
   created_at timestamptz not null default now()
 );
 
-create index on public.mail_attachments (message_id);
+create index on mail.attachments (message_id);
 
 -- ------------------------------------------------------------
--- mail_drafts: 下書き (AI 生成 or 手動)
+-- mail.drafts: 下書き (AI 生成 or 手動)
 -- ------------------------------------------------------------
-create table public.mail_drafts (
+create table mail.drafts (
   id uuid primary key default gen_random_uuid(),
-  account_id uuid not null references public.mail_accounts(id) on delete cascade,
+  account_id uuid not null references mail.accounts(id) on delete cascade,
   author_id uuid not null references auth.users(id) on delete cascade,
-  in_reply_to_message_id uuid references public.mail_messages(id) on delete set null,
-  thread_id uuid references public.mail_threads(id) on delete set null,
+  in_reply_to_message_id uuid references mail.messages(id) on delete set null,
+  thread_id uuid references mail.threads(id) on delete set null,
   to_addresses text[] not null default '{}',
   cc_addresses text[] default '{}',
   bcc_addresses text[] default '{}',
@@ -140,125 +149,131 @@ create table public.mail_drafts (
   updated_at timestamptz not null default now()
 );
 
-create index on public.mail_drafts (account_id, status);
-create index on public.mail_drafts (author_id);
+create index on mail.drafts (account_id, status);
+create index on mail.drafts (author_id);
 
 -- ------------------------------------------------------------
 -- updated_at トリガ
 -- ------------------------------------------------------------
-create or replace function public.tg_set_updated_at()
+create or replace function mail.tg_set_updated_at()
 returns trigger language plpgsql as $$
 begin new.updated_at = now(); return new; end;
 $$;
 
-create trigger mail_accounts_updated before update on public.mail_accounts
-  for each row execute function public.tg_set_updated_at();
-create trigger mail_drafts_updated before update on public.mail_drafts
-  for each row execute function public.tg_set_updated_at();
+create trigger accounts_updated before update on mail.accounts
+  for each row execute function mail.tg_set_updated_at();
+create trigger drafts_updated before update on mail.drafts
+  for each row execute function mail.tg_set_updated_at();
 
 -- ============================================================
 -- RLS
 -- ============================================================
 
-alter table public.mail_accounts enable row level security;
-alter table public.mail_account_members enable row level security;
-alter table public.mail_threads enable row level security;
-alter table public.mail_messages enable row level security;
-alter table public.mail_message_reads enable row level security;
-alter table public.mail_attachments enable row level security;
-alter table public.mail_drafts enable row level security;
+alter table mail.accounts enable row level security;
+alter table mail.account_members enable row level security;
+alter table mail.threads enable row level security;
+alter table mail.messages enable row level security;
+alter table mail.message_reads enable row level security;
+alter table mail.attachments enable row level security;
+alter table mail.drafts enable row level security;
 
 -- アカウントへのアクセス判定ヘルパ
-create or replace function public.has_account_access(p_account_id uuid)
-returns boolean language sql stable security definer as $$
+create or replace function mail.has_account_access(p_account_id uuid)
+returns boolean language sql stable security definer
+set search_path = mail, public as $$
   select exists (
-    select 1 from public.mail_accounts a
+    select 1 from mail.accounts a
     where a.id = p_account_id
       and (
         a.owner_id = auth.uid()
         or (a.is_shared and exists (
-          select 1 from public.mail_account_members m
+          select 1 from mail.account_members m
           where m.account_id = a.id and m.user_id = auth.uid()
         ))
       )
   );
 $$;
 
--- mail_accounts ポリシ
+-- 認証ユーザから has_account_access を呼べるようにする
+grant execute on function mail.has_account_access(uuid) to authenticated, service_role;
+
+-- mail.accounts ポリシ
 create policy "own or shared accounts readable"
-  on public.mail_accounts for select
+  on mail.accounts for select
   using (
     owner_id = auth.uid()
     or (is_shared and exists (
-      select 1 from public.mail_account_members m
+      select 1 from mail.account_members m
       where m.account_id = id and m.user_id = auth.uid()
     ))
   );
 
 create policy "owner manages account"
-  on public.mail_accounts for all
+  on mail.accounts for all
   using (owner_id = auth.uid())
   with check (owner_id = auth.uid());
 
--- mail_account_members ポリシ
+-- mail.account_members ポリシ
 create policy "members visible to account participants"
-  on public.mail_account_members for select
-  using (public.has_account_access(account_id));
+  on mail.account_members for select
+  using (mail.has_account_access(account_id));
 
 create policy "owner manages members"
-  on public.mail_account_members for all
+  on mail.account_members for all
   using (
     exists (
-      select 1 from public.mail_accounts a
+      select 1 from mail.accounts a
       where a.id = account_id and a.owner_id = auth.uid()
     )
   );
 
--- mail_threads / mail_messages ポリシ (アカウントアクセス権に従う)
+-- mail.threads / mail.messages ポリシ (アカウントアクセス権に従う)
 create policy "threads follow account access"
-  on public.mail_threads for select
-  using (public.has_account_access(account_id));
+  on mail.threads for select
+  using (mail.has_account_access(account_id));
 
 create policy "messages follow account access"
-  on public.mail_messages for select
-  using (public.has_account_access(account_id));
+  on mail.messages for select
+  using (mail.has_account_access(account_id));
 
 create policy "attachments follow message access"
-  on public.mail_attachments for select
+  on mail.attachments for select
   using (
     exists (
-      select 1 from public.mail_messages m
-      where m.id = message_id and public.has_account_access(m.account_id)
+      select 1 from mail.messages m
+      where m.id = mail.attachments.message_id
+        and mail.has_account_access(m.account_id)
     )
   );
 
--- mail_message_reads: 自分の既読記録のみ操作可 / 共有アカウントでは他人の記録も閲覧可
+-- mail.message_reads: 自分の既読記録のみ操作可 / 共有アカウントでは他人の記録も閲覧可
 create policy "reads visible within shared account"
-  on public.mail_message_reads for select
+  on mail.message_reads for select
   using (
     exists (
-      select 1 from public.mail_messages m
-      where m.id = message_id and public.has_account_access(m.account_id)
+      select 1 from mail.messages m
+      where m.id = mail.message_reads.message_id
+        and mail.has_account_access(m.account_id)
     )
   );
 
 create policy "user manages own reads"
-  on public.mail_message_reads for insert
+  on mail.message_reads for insert
   with check (user_id = auth.uid());
 
 create policy "user deletes own reads"
-  on public.mail_message_reads for delete
+  on mail.message_reads for delete
   using (user_id = auth.uid());
 
--- mail_drafts ポリシ
+-- mail.drafts ポリシ
 create policy "drafts readable by author or shared account members"
-  on public.mail_drafts for select
+  on mail.drafts for select
   using (
     author_id = auth.uid()
-    or public.has_account_access(account_id)
+    or mail.has_account_access(account_id)
   );
 
 create policy "author manages own drafts"
-  on public.mail_drafts for all
+  on mail.drafts for all
   using (author_id = auth.uid())
-  with check (author_id = auth.uid() and public.has_account_access(account_id));
+  with check (author_id = auth.uid() and mail.has_account_access(account_id));

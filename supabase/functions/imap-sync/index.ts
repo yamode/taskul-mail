@@ -10,6 +10,7 @@
 import { ImapFlow } from "npm:imapflow@1.0.164";
 import { simpleParser } from "npm:mailparser@3.6.9";
 import { adminClient, readSecret } from "../_shared/vault.ts";
+import { handlePreflight, jsonResponse } from "../_shared/cors.ts";
 
 type AccountRow = {
   id: string;
@@ -97,7 +98,7 @@ async function syncOneAccount(account: AccountRow) {
       const refKeys = [inReplyTo, ...references].filter(Boolean) as string[];
       if (refKeys.length > 0) {
         const { data: existing } = await sb
-          .from("mail_messages")
+          .from("messages")
           .select("thread_id")
           .eq("account_id", account.id)
           .in("message_id", refKeys)
@@ -110,7 +111,7 @@ async function syncOneAccount(account: AccountRow) {
       if (!threadId) {
         // 同件名で直近 14 日以内のスレッドに合流、なければ新規
         const { data: recent } = await sb
-          .from("mail_threads")
+          .from("threads")
           .select("id")
           .eq("account_id", account.id)
           .eq("subject_normalized", subjectNorm)
@@ -126,7 +127,7 @@ async function syncOneAccount(account: AccountRow) {
           threadId = recent.id;
         } else {
           const { data: created, error: tErr } = await sb
-            .from("mail_threads")
+            .from("threads")
             .insert({
               account_id: account.id,
               subject_normalized: subjectNorm,
@@ -146,7 +147,7 @@ async function syncOneAccount(account: AccountRow) {
       }
 
       // メッセージ insert (重複は account_id+imap_uid の unique で弾く)
-      const { error: mErr } = await sb.from("mail_messages").upsert(
+      const { error: mErr } = await sb.from("messages").upsert(
         {
           account_id: account.id,
           thread_id: threadId,
@@ -176,11 +177,11 @@ async function syncOneAccount(account: AccountRow) {
 
       // スレッドのメタ情報更新
       await sb
-        .from("mail_threads")
+        .from("threads")
         .update({
           last_message_at: (parsed.date ?? new Date()).toISOString(),
           message_count: (await sb
-            .from("mail_messages")
+            .from("messages")
             .select("id", { count: "exact", head: true })
             .eq("thread_id", threadId!)).count ?? 0,
         })
@@ -191,7 +192,7 @@ async function syncOneAccount(account: AccountRow) {
 
     // アカウントの同期ステート更新
     await sb
-      .from("mail_accounts")
+      .from("accounts")
       .update({
         last_uid: maxSeenUid,
         last_uidvalidity: Number(mailbox.uidValidity),
@@ -205,13 +206,16 @@ async function syncOneAccount(account: AccountRow) {
 }
 
 Deno.serve(async (req) => {
+  const pre = handlePreflight(req);
+  if (pre) return pre;
+
   // 単発アカウント指定 or 全件
   const url = new URL(req.url);
   const accountId = url.searchParams.get("account_id");
 
   const sb = adminClient();
   const q = sb
-    .from("mail_accounts")
+    .from("accounts")
     .select(
       "id,email_address,imap_host,imap_port,username,password_secret_id,last_uid,last_uidvalidity",
     );
@@ -220,10 +224,7 @@ Deno.serve(async (req) => {
     : await q;
 
   if (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
+    return jsonResponse(req, { error: error.message }, 500);
   }
 
   const results: Record<string, string> = {};
@@ -237,7 +238,5 @@ Deno.serve(async (req) => {
     }
   }
 
-  return new Response(JSON.stringify({ results }), {
-    headers: { "content-type": "application/json" },
-  });
+  return jsonResponse(req, { results });
 });

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { supabase, fnUrl, authHeader } from "$lib/supabase";
+  import { supabase, mail, fnUrl, authHeader } from "$lib/supabase";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
 
@@ -17,8 +17,8 @@
   let draftId = $state<string | null>(null);
 
   onMount(async () => {
-    const { data } = await supabase
-      .from("mail_accounts")
+    const { data } = await mail
+      .from("accounts")
       .select("id,label,email_address")
       .order("created_at");
     accounts = (data ?? []) as Account[];
@@ -47,15 +47,15 @@
         status: "draft" as const,
       };
       if (draftId) {
-        const { error } = await supabase
-          .from("mail_drafts")
+        const { error } = await mail
+          .from("drafts")
           .update(payload)
           .eq("id", draftId);
         if (error) throw error;
         return draftId;
       } else {
-        const { data, error } = await supabase
-          .from("mail_drafts")
+        const { data, error } = await mail
+          .from("drafts")
           .insert(payload)
           .select("id")
           .single();

@@ -7,6 +7,9 @@ export const supabase = createBrowserClient(
   PUBLIC_SUPABASE_ANON_KEY,
 );
 
+/** mail スキーマ専用クライアント (ほぼ全ての DB 操作はこちら経由) */
+export const mail = supabase.schema("mail" as any);
+
 export function fnUrl(name: string, query?: Record<string, string>): string {
   const base = `${PUBLIC_SUPABASE_URL}/functions/v1/${name}`;
   if (!query) return base;

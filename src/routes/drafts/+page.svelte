@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { supabase, fnUrl, authHeader } from "$lib/supabase";
+  import { supabase, mail, fnUrl, authHeader } from "$lib/supabase";
   import { onMount } from "svelte";
 
   type Draft = {
@@ -12,7 +12,7 @@
     status: string;
     generated_by_ai: boolean;
     updated_at: string;
-    mail_accounts?: { label: string } | null;
+    accounts?: { label: string } | null;
   };
 
   let drafts = $state<Draft[]>([]);
@@ -22,10 +22,10 @@
   onMount(load);
 
   async function load() {
-    const { data } = await supabase
-      .from("mail_drafts")
+    const { data } = await mail
+      .from("drafts")
       .select(
-        "id,account_id,subject,body_text,to_addresses,cc_addresses,status,generated_by_ai,updated_at,mail_accounts(label)",
+        "id,account_id,subject,body_text,to_addresses,cc_addresses,status,generated_by_ai,updated_at,accounts(label)",
       )
       .eq("status", "draft")
       .order("updated_at", { ascending: false });
@@ -34,8 +34,8 @@
 
   async function save() {
     if (!selected) return;
-    await supabase
-      .from("mail_drafts")
+    await mail
+      .from("drafts")
       .update({
         subject: selected.subject,
         body_text: selected.body_text,
@@ -48,7 +48,7 @@
 
   async function discard(id: string) {
     if (!confirm("この下書きを破棄しますか？")) return;
-    await supabase.from("mail_drafts").update({ status: "discarded" }).eq("id", id);
+    await mail.from("drafts").update({ status: "discarded" }).eq("id", id);
     if (selected?.id === id) selected = null;
     await load();
   }
@@ -92,7 +92,7 @@
         onclick={() => (selected = { ...d })}
       >
         <div class="meta">
-          <span class="label">{d.mail_accounts?.label ?? ""}</span>
+          <span class="label">{d.accounts?.label ?? ""}</span>
           {#if d.generated_by_ai}<span class="ai">AI</span>{/if}
           <span class="date">{new Date(d.updated_at).toLocaleDateString("ja-JP")}</span>
         </div>

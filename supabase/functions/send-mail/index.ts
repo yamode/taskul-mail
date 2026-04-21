@@ -7,6 +7,7 @@
 
 import nodemailer from "npm:nodemailer@6.9.16";
 import { adminClient, readSecret } from "../_shared/vault.ts";
+import { handlePreflight, jsonResponse, corsHeaders } from "../_shared/cors.ts";
 
 async function authUserId(req: Request): Promise<string> {
   const token = req.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
@@ -18,8 +19,10 @@ async function authUserId(req: Request): Promise<string> {
 }
 
 Deno.serve(async (req) => {
+  const pre = handlePreflight(req);
+  if (pre) return pre;
   if (req.method !== "POST") {
-    return new Response("method not allowed", { status: 405 });
+    return new Response("method not allowed", { status: 405, headers: corsHeaders(req) });
   }
 
   try {
@@ -31,7 +34,7 @@ Deno.serve(async (req) => {
 
     // 下書き取得 + 作者チェック
     const { data: draft, error: dErr } = await sb
-      .from("mail_drafts")
+      .from("drafts")
       .select(
         "id,account_id,author_id,in_reply_to_message_id,thread_id,to_addresses,cc_addresses,bcc_addresses,subject,body_text,status",
       )
@@ -39,7 +42,7 @@ Deno.serve(async (req) => {
       .single();
     if (dErr || !draft) throw new Error("draft not found");
     if (draft.author_id !== userId) {
-      return new Response("forbidden", { status: 403 });
+      return new Response("forbidden", { status: 403, headers: corsHeaders(req) });
     }
     if (draft.status !== "draft") {
       throw new Error(`cannot send: status=${draft.status}`);
@@ -47,7 +50,7 @@ Deno.serve(async (req) => {
 
     // アカウント情報 + パスワード
     const { data: acc, error: aErr } = await sb
-      .from("mail_accounts")
+      .from("accounts")
       .select(
         "id,email_address,smtp_host,smtp_port,username,password_secret_id",
       )
@@ -62,7 +65,7 @@ Deno.serve(async (req) => {
     let references: string[] = [];
     if (draft.in_reply_to_message_id) {
       const { data: src } = await sb
-        .from("mail_messages")
+        .from("messages")
         .select("message_id,message_references")
         .eq("id", draft.in_reply_to_message_id)
         .single();
@@ -93,13 +96,13 @@ Deno.serve(async (req) => {
     // 送信済マーク + 送信メッセージを messages に記録
     const now = new Date().toISOString();
     await sb
-      .from("mail_drafts")
+      .from("drafts")
       .update({ status: "sent", sent_at: now })
       .eq("id", draft.id);
 
     // outbound として保存 (imap_uid は負値で擬似ユニーク: 重複回避)
     const pseudoUid = -Math.floor(Date.now() / 1000);
-    await sb.from("mail_messages").insert({
+    await sb.from("messages").insert({
       account_id: acc.id,
       thread_id: draft.thread_id,
       imap_uid: pseudoUid,
@@ -117,14 +120,8 @@ Deno.serve(async (req) => {
       direction: "outbound",
     });
 
-    return new Response(
-      JSON.stringify({ ok: true, message_id: info.messageId }),
-      { headers: { "content-type": "application/json" } },
-    );
+    return jsonResponse(req, { ok: true, message_id: info.messageId });
   } catch (e) {
-    return new Response(
-      JSON.stringify({ error: (e as Error).message }),
-      { status: 400, headers: { "content-type": "application/json" } },
-    );
+    return jsonResponse(req, { error: (e as Error).message }, 400);
   }
 });

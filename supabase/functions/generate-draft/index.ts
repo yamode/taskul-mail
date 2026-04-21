@@ -9,6 +9,7 @@
 
 import Anthropic from "npm:@anthropic-ai/sdk@0.68.0";
 import { adminClient } from "../_shared/vault.ts";
+import { handlePreflight, jsonResponse, corsHeaders } from "../_shared/cors.ts";
 
 const MODEL = "claude-sonnet-4-5-20250929";
 
@@ -46,8 +47,10 @@ async function authUserId(req: Request): Promise<string> {
 }
 
 Deno.serve(async (req) => {
+  const pre = handlePreflight(req);
+  if (pre) return pre;
   if (req.method !== "POST") {
-    return new Response("method not allowed", { status: 405 });
+    return new Response("method not allowed", { status: 405, headers: corsHeaders(req) });
   }
 
   try {
@@ -59,7 +62,7 @@ Deno.serve(async (req) => {
 
     // 返信元メッセージ取得 + アクセスチェック
     const { data: target, error: tErr } = await sb
-      .from("mail_messages")
+      .from("messages")
       .select(
         "id,account_id,thread_id,from_address,from_name,to_addresses,cc_addresses,subject,body_text,received_at",
       )
@@ -69,7 +72,7 @@ Deno.serve(async (req) => {
 
     // service_role では auth.uid() が効かないので明示チェック
     const { data: acc } = await sb
-      .from("mail_accounts")
+      .from("accounts")
       .select("owner_id,is_shared")
       .eq("id", target.account_id)
       .single();
@@ -78,7 +81,7 @@ Deno.serve(async (req) => {
     let allowed = acc.owner_id === userId;
     if (!allowed && acc.is_shared) {
       const { data: member } = await sb
-        .from("mail_account_members")
+        .from("account_members")
         .select("user_id")
         .eq("account_id", target.account_id)
         .eq("user_id", userId)
@@ -86,14 +89,14 @@ Deno.serve(async (req) => {
       allowed = !!member;
     }
     if (!allowed) {
-      return new Response("forbidden", { status: 403 });
+      return new Response("forbidden", { status: 403, headers: corsHeaders(req) });
     }
 
     // スレッド文脈: 同スレッドの過去メッセージを時系列で最大 10 件
     let thread: Msg[] = [];
     if (target.thread_id) {
       const { data } = await sb
-        .from("mail_messages")
+        .from("messages")
         .select(
           "id,account_id,thread_id,from_address,from_name,to_addresses,cc_addresses,subject,body_text,received_at",
         )
@@ -149,7 +152,7 @@ Deno.serve(async (req) => {
 
     // 下書き保存
     const { data: draft, error: dErr } = await sb
-      .from("mail_drafts")
+      .from("drafts")
       .insert({
         account_id: target.account_id,
         author_id: userId,
@@ -167,18 +170,12 @@ Deno.serve(async (req) => {
       .single();
     if (dErr) throw dErr;
 
-    return new Response(
-      JSON.stringify({
-        draft_id: draft!.id,
-        subject: draft!.subject,
-        body_text: draft!.body_text,
-      }),
-      { headers: { "content-type": "application/json" } },
-    );
+    return jsonResponse(req, {
+      draft_id: draft!.id,
+      subject: draft!.subject,
+      body_text: draft!.body_text,
+    });
   } catch (e) {
-    return new Response(
-      JSON.stringify({ error: (e as Error).message }),
-      { status: 400, headers: { "content-type": "application/json" } },
-    );
+    return jsonResponse(req, { error: (e as Error).message }, 400);
   }
 });

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { supabase, fnUrl, authHeader } from "$lib/supabase";
+  import { supabase, mail, fnUrl, authHeader } from "$lib/supabase";
   import { onMount } from "svelte";
 
   type Thread = {
@@ -48,38 +48,38 @@
   });
 
   async function loadAccounts() {
-    const { data } = await supabase
-      .from("mail_accounts")
+    const { data } = await mail
+      .from("accounts")
       .select("id,label,is_shared")
       .order("created_at");
     accounts = (data ?? []) as Account[];
   }
 
   async function loadThreads() {
-    const { data, error } = await supabase
-      .from("mail_threads")
+    const { data, error } = await mail
+      .from("threads")
       .select(
-        "id,account_id,subject_normalized,participants,last_message_at,message_count,mail_accounts(label)",
+        "id,account_id,subject_normalized,participants,last_message_at,message_count,accounts(label)",
       )
       .order("last_message_at", { ascending: false })
       .limit(100);
     if (error) { console.error(error); return; }
     const base: Thread[] = (data ?? []).map((t: any) => ({
       ...t,
-      account_label: t.mail_accounts?.label,
+      account_label: t.accounts?.label,
     }));
 
     // 未読カウント: inbound メッセージ数 - 自分の既読数
     if (base.length > 0 && userId) {
       const threadIds = base.map((t) => t.id);
       const [{ data: inbound }, { data: reads }] = await Promise.all([
-        supabase
-          .from("mail_messages")
+        mail
+          .from("messages")
           .select("id,thread_id")
           .in("thread_id", threadIds)
           .eq("direction", "inbound"),
-        supabase
-          .from("mail_message_reads")
+        mail
+          .from("message_reads")
           .select("message_id")
           .eq("user_id", userId),
       ]);
@@ -99,8 +99,8 @@
     selectedThreadId = t.id;
     selectedMessageId = null;
     draft = null;
-    const { data } = await supabase
-      .from("mail_messages")
+    const { data } = await mail
+      .from("messages")
       .select("id,from_address,from_name,subject,body_text,received_at,direction")
       .eq("thread_id", t.id)
       .order("received_at", { ascending: true });
@@ -136,8 +136,8 @@
 
   async function saveDraftEdits() {
     if (!draft) return;
-    await supabase
-      .from("mail_drafts")
+    await mail
+      .from("drafts")
       .update({ subject: draft.subject, body_text: draft.body_text })
       .eq("id", draft.id);
   }
@@ -170,8 +170,8 @@
 
   async function markRead(messageId: string) {
     if (!userId) return;
-    await supabase
-      .from("mail_message_reads")
+    await mail
+      .from("message_reads")
       .upsert({ message_id: messageId, user_id: userId });
     // ローカル未読カウントを即座に減らす
     if (selectedThreadId) {

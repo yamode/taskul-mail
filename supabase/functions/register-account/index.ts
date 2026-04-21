@@ -4,6 +4,7 @@
 //  password_secret_id に有効な Vault ID を入れる必要があるため)
 
 import { adminClient, createSecret } from "../_shared/vault.ts";
+import { handlePreflight, jsonResponse, corsHeaders } from "../_shared/cors.ts";
 
 async function authUserId(req: Request): Promise<string> {
   const token = req.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
@@ -15,7 +16,11 @@ async function authUserId(req: Request): Promise<string> {
 }
 
 Deno.serve(async (req) => {
-  if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+  const pre = handlePreflight(req);
+  if (pre) return pre;
+  if (req.method !== "POST") {
+    return new Response("method not allowed", { status: 405, headers: corsHeaders(req) });
+  }
 
   try {
     const userId = await authUserId(req);
@@ -43,7 +48,7 @@ Deno.serve(async (req) => {
 
     // アカウント作成
     const { data, error } = await sb
-      .from("mail_accounts")
+      .from("accounts")
       .insert({
         owner_id: userId,
         label,
@@ -62,20 +67,15 @@ Deno.serve(async (req) => {
 
     // 共有アカウントなら owner をメンバーにも登録
     if (is_shared) {
-      await sb.from("mail_account_members").insert({
+      await sb.from("account_members").insert({
         account_id: data!.id,
         user_id: userId,
         role: "owner",
       });
     }
 
-    return new Response(JSON.stringify({ id: data!.id }), {
-      headers: { "content-type": "application/json" },
-    });
+    return jsonResponse(req, { id: data!.id });
   } catch (e) {
-    return new Response(JSON.stringify({ error: (e as Error).message }), {
-      status: 400,
-      headers: { "content-type": "application/json" },
-    });
+    return jsonResponse(req, { error: (e as Error).message }, 400);
   }
 });

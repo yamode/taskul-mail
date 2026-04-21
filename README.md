@@ -30,9 +30,14 @@ supabase login
 supabase init
 supabase link --project-ref <YOUR_PROJECT_REF>
 
-# Vault 拡張を有効化
+# Vault 拡張有効化 + mail スキーマ + RLS を適用
 supabase db push
 ```
+
+**⚠️ 重要**: マイグレーション適用後、Supabase Dashboard の
+**Project Settings → API → "Exposed schemas"** に `mail` を追加すること。
+これをしないと PostgREST / supabase-js から `mail.*` テーブルにアクセスできない
+(taskul と相乗りさせる場合も忘れずに)。
 
 ### 2. 環境変数 (Edge Functions シークレット)
 
