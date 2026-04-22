@@ -9,6 +9,7 @@
     participants: string[];
     last_message_at: string;
     message_count: number;
+    trashed_at?: string | null;
     account_label?: string;
     unread_count?: number;
   };
@@ -27,17 +28,32 @@
   };
   type Account = { id: string; label: string; is_shared: boolean; sort_order?: number; unread_count?: number };
 
+  // 返信/転送時のインラインコンポーズ状態。
+  // gmail のように本文エリアを返信レイアウトに入れ替える。
+  type Compose = {
+    id: string;
+    mode: "reply" | "forward";
+    sourceMessageId: string;
+    subject: string;
+    to: string[];
+    cc: string[];
+    userBody: string;    // ユーザが書く部分
+    quotedBody: string;  // 引用本文 (divider 以降)
+    showQuoted: boolean;
+  };
+
   let threads = $state<Thread[]>([]);
   let accounts = $state<Account[]>([]);
   let filterAccountId = $state<string>("all");
   let selectedThreadId = $state<string | null>(null);
   let messages = $state<Message[]>([]);
   let selectedMessageId = $state<string | null>(null);
-  let draft = $state<{ subject: string; body_text: string; id: string } | null>(null);
+  let compose = $state<Compose | null>(null);
   let generating = $state(false);
   let sending = $state(false);
   let hint = $state("");
   let userId = $state<string | null>(null);
+  let hoverThreadId = $state<string | null>(null);
 
   let filtered = $derived(
     filterAccountId === "all"
@@ -45,29 +61,65 @@
       : threads.filter((t) => t.account_id === filterAccountId),
   );
 
-  let syncTimer: ReturnType<typeof setInterval> | null = null;
+  // 同期状態: imap-sync 呼び出し中かどうかと、最後に完了した時刻・エラー。
   let syncing = $state(false);
+  let lastSyncedAt = $state<number | null>(null);
+  let syncError = $state<string | null>(null);
+  let nowTick = $state(Date.now()); // 相対時刻表示を 30 秒ごとに更新するためのトリガ
+
+  // "いま"の再計算用タイマ
+  let clockTimer: ReturnType<typeof setInterval> | null = null;
+  let syncTimer: ReturnType<typeof setInterval> | null = null;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let realtimeChannel: ReturnType<typeof supabase.channel> | null = null;
+
+  // Gmail ライクなリアルタイム性:
+  //   (a) Supabase Realtime で mail.messages INSERT を購読し、即座に反映
+  //   (b) 15 秒ごとに threads テーブルだけを軽量 poll するフォールバック
+  //   (c) 60 秒ごとに IMAP sync を実行 (重いので頻度は維持)
+  const IMAP_SYNC_INTERVAL = 60_000;
+  const DB_POLL_INTERVAL = 15_000;
+  const IMAP_SYNC_TIMEOUT = 45_000;
 
   async function syncTick() {
     if (typeof document !== "undefined" && document.hidden) return;
     if (syncing) return;
     syncing = true;
+    syncError = null;
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), IMAP_SYNC_TIMEOUT);
     try {
-      await fetch(fnUrl("imap-sync"), {
+      const res = await fetch(fnUrl("imap-sync"), {
         method: "POST",
         headers: await authHeader(),
+        signal: controller.signal,
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      lastSyncedAt = Date.now();
       await loadThreads();
       if (selectedThreadId) await loadMessages(selectedThreadId);
     } catch (e) {
-      console.error("sync tick failed", e);
+      // abort (timeout) もここに来る。UI は同期停止扱いにして次回 tick に任せる。
+      syncError = (e as Error).name === "AbortError" ? "タイムアウト" : (e as Error).message;
+      console.warn("sync tick failed", e);
     } finally {
+      clearTimeout(to);
       syncing = false;
     }
   }
 
+  // 軽量 poll: threads テーブルを見て新着があれば UI 更新。
+  async function lightPoll() {
+    if (typeof document !== "undefined" && document.hidden) return;
+    await loadThreads();
+    if (selectedThreadId) await loadMessages(selectedThreadId);
+  }
+
   function onVisibility() {
-    if (!document.hidden) void syncTick();
+    if (!document.hidden) {
+      void lightPoll();
+      void syncTick();
+    }
   }
 
   onMount(async () => {
@@ -75,17 +127,47 @@
     userId = user?.id ?? null;
     await Promise.all([loadAccounts(), loadThreads()]);
 
-    // 受信トレイを開いている間は 60 秒ごとに IMAP 同期 → スレッド再読込。
-    // タブが非アクティブな間はスキップし、フォーカスが戻ったら即 1 回同期する。
-    syncTimer = setInterval(syncTick, 60_000);
+    // IMAP 同期は 60 秒に 1 回 (重いので頻度据え置き)
+    syncTimer = setInterval(syncTick, IMAP_SYNC_INTERVAL);
+    // DB poll は 15 秒に 1 回 (軽量・gmail ライク)
+    pollTimer = setInterval(lightPoll, DB_POLL_INTERVAL);
+    // 相対時刻表示の更新 (30 秒に 1 回)
+    clockTimer = setInterval(() => (nowTick = Date.now()), 30_000);
+
     document.addEventListener("visibilitychange", onVisibility);
+
+    // Realtime: mail.messages INSERT を購読 (publication に登録済みの場合のみ届く)
+    try {
+      realtimeChannel = supabase
+        .channel("mail-inbox")
+        .on(
+          // @ts-ignore — schema を 'mail' に指定
+          "postgres_changes",
+          { event: "INSERT", schema: "mail", table: "messages" },
+          (payload: any) => {
+            void loadThreads();
+            if (selectedThreadId && payload?.new?.thread_id === selectedThreadId) {
+              void loadMessages(selectedThreadId);
+            }
+          },
+        )
+        .subscribe();
+    } catch (e) {
+      console.warn("realtime subscribe failed (fallback to polling)", e);
+    }
+
     void syncTick();
   });
 
   onDestroy(() => {
     if (syncTimer) clearInterval(syncTimer);
+    if (pollTimer) clearInterval(pollTimer);
+    if (clockTimer) clearInterval(clockTimer);
     if (typeof document !== "undefined") {
       document.removeEventListener("visibilitychange", onVisibility);
+    }
+    if (realtimeChannel) {
+      supabase.removeChannel(realtimeChannel);
     }
   });
 
@@ -98,7 +180,6 @@
     accounts = (data ?? []) as Account[];
   }
 
-  // D&D 並び替え: sort_order をまとめて更新。楽観的に UI を先に更新し、失敗したら再読込。
   let dragId = $state<string | null>(null);
   async function onDropAccount(targetId: string) {
     if (!dragId || dragId === targetId) return;
@@ -122,26 +203,43 @@
     }
   }
 
-  // 新着スレッド検出用: 前回ロード時のスレッドIDセット。
-  // ここにない ID が新たに出現したらアニメーション対象とする。
   let knownThreadIds = new Set<string>();
   let newThreadIds = $state<Set<string>>(new Set());
 
   async function loadThreads() {
+    // trashed_at is null のみ表示 (migration 未適用環境では全件取れる)
     const { data, error } = await mail
       .from("threads")
       .select(
-        "id,account_id,subject_normalized,participants,last_message_at,message_count,accounts(label)",
+        "id,account_id,subject_normalized,participants,last_message_at,message_count,trashed_at,accounts(label)",
       )
+      .is("trashed_at", null)
       .order("last_message_at", { ascending: false })
       .limit(100);
-    if (error) { console.error(error); return; }
-    const base: Thread[] = (data ?? []).map((t: any) => ({
+    if (error) {
+      // migration 未適用で trashed_at カラムが無い環境のフォールバック
+      if (/trashed_at/.test(error.message ?? "")) {
+        const { data: data2 } = await mail
+          .from("threads")
+          .select(
+            "id,account_id,subject_normalized,participants,last_message_at,message_count,accounts(label)",
+          )
+          .order("last_message_at", { ascending: false })
+          .limit(100);
+        return applyThreads((data2 ?? []) as any[]);
+      }
+      console.error(error);
+      return;
+    }
+    applyThreads((data ?? []) as any[]);
+  }
+
+  async function applyThreads(rows: any[]) {
+    const base: Thread[] = rows.map((t: any) => ({
       ...t,
       account_label: t.accounts?.label,
     }));
 
-    // 未読カウント: inbound メッセージ数 - 自分の既読数
     const perAccount = new Map<string, number>();
     if (base.length > 0 && userId) {
       const threadIds = base.map((t) => t.id);
@@ -167,13 +265,11 @@
       for (const t of base) t.unread_count = counts.get(t.id) ?? 0;
     }
 
-    // 未読カウントをアカウントに反映
     accounts = accounts.map((a) => ({
       ...a,
       unread_count: perAccount.get(a.id) ?? 0,
     }));
 
-    // 新着スレッド検出 (初回ロード時はアニメなし)
     const justArrived = new Set<string>();
     if (knownThreadIds.size > 0) {
       for (const t of base) {
@@ -183,7 +279,6 @@
     knownThreadIds = new Set(base.map((t) => t.id));
     if (justArrived.size > 0) {
       newThreadIds = justArrived;
-      // 3 秒後にアニメーション対象から外す
       setTimeout(() => { newThreadIds = new Set(); }, 3000);
     }
     threads = base;
@@ -203,7 +298,7 @@
   async function openThread(t: Thread) {
     selectedThreadId = t.id;
     selectedMessageId = null;
-    draft = null;
+    compose = null;
     await loadMessages(t.id);
     if (messages.length > 0) {
       const last = [...messages].reverse().find((m) => m.direction === "inbound");
@@ -214,9 +309,37 @@
     }
   }
 
-  async function startManualReply(replyAll = false) {
-    if (!selectedMessageId) return;
-    const src = messages.find((m) => m.id === selectedMessageId);
+  // ------------------------------------------------------------
+  // 返信・転送 (インライン展開)
+  // ------------------------------------------------------------
+
+  function buildQuoted(src: Message): string {
+    const quoted = (src.body_text ?? "")
+      .split("\n").map((l) => `> ${l}`).join("\n");
+    const header = `--- ${new Date(src.received_at).toLocaleString("ja-JP")} ${src.from_name ?? src.from_address ?? ""} さんが書きました ---`;
+    return `${header}\n${quoted}`;
+  }
+
+  function buildForwardHeader(src: Message): string {
+    return (
+      `--- 転送メッセージ ---\n` +
+      `From: ${src.from_name ? `${src.from_name} <${src.from_address}>` : src.from_address ?? ""}\n` +
+      `Date: ${new Date(src.received_at).toLocaleString("ja-JP")}\n` +
+      `Subject: ${src.subject ?? ""}\n` +
+      `To: ${(src.to_addresses ?? []).join(", ")}\n\n` +
+      (src.body_text ?? "")
+    );
+  }
+
+  function assembleBody(c: Compose): string {
+    const u = (c.userBody ?? "").replace(/\s+$/, "");
+    const q = c.quotedBody ?? "";
+    return q ? `${u}\n\n${q}` : u;
+  }
+
+  async function startReply(replyAll = false) {
+    const srcId = selectedMessageId;
+    const src = messages.find((m) => m.id === srcId);
     if (!src || !src.account_id) return;
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return;
@@ -227,9 +350,18 @@
       ? [...(src.to_addresses ?? []), ...(src.cc_addresses ?? [])]
           .filter((a) => a && a !== src.from_address)
       : [];
-    const quoted = (src.body_text ?? "")
-      .split("\n").map((l) => `> ${l}`).join("\n");
-    const body = `\n\n--- ${new Date(src.received_at).toLocaleString("ja-JP")} ${src.from_name ?? src.from_address ?? ""} さんが書きました ---\n${quoted}`;
+    const quotedBody = buildQuoted(src);
+    const bodyText = assembleBody({
+      id: "",
+      mode: "reply",
+      sourceMessageId: src.id,
+      subject,
+      to,
+      cc,
+      userBody: "",
+      quotedBody,
+      showQuoted: false,
+    });
 
     const { data, error } = await mail
       .from("drafts")
@@ -241,31 +373,47 @@
         to_addresses: to,
         cc_addresses: cc,
         subject,
-        body_text: body,
+        body_text: bodyText,
         generated_by_ai: false,
         status: "draft",
       })
-      .select("id,subject,body_text")
+      .select("id")
       .single();
     if (error) { alert(`下書き作成失敗: ${error.message}`); return; }
-    draft = { id: data!.id, subject: data!.subject ?? subject, body_text: data!.body_text ?? body };
+
+    compose = {
+      id: data!.id,
+      mode: "reply",
+      sourceMessageId: src.id,
+      subject,
+      to,
+      cc,
+      userBody: "",
+      quotedBody,
+      showQuoted: false,
+    };
   }
 
-  async function startForward() {
-    if (!selectedMessageId) return;
-    const src = messages.find((m) => m.id === selectedMessageId);
+  async function startForward(fromMessageId?: string) {
+    const srcId = fromMessageId ?? selectedMessageId;
+    const src = messages.find((m) => m.id === srcId);
     if (!src || !src.account_id) return;
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return;
 
     const subject = src.subject?.match(/^\s*fwd?\s*:/i) ? src.subject : `Fwd: ${src.subject ?? ""}`;
-    const header =
-      `\n\n--- 転送メッセージ ---\n` +
-      `From: ${src.from_name ? `${src.from_name} <${src.from_address}>` : src.from_address ?? ""}\n` +
-      `Date: ${new Date(src.received_at).toLocaleString("ja-JP")}\n` +
-      `Subject: ${src.subject ?? ""}\n` +
-      `To: ${(src.to_addresses ?? []).join(", ")}\n\n`;
-    const body = header + (src.body_text ?? "");
+    const quotedBody = buildForwardHeader(src);
+    const bodyText = assembleBody({
+      id: "",
+      mode: "forward",
+      sourceMessageId: src.id,
+      subject,
+      to: [],
+      cc: [],
+      userBody: "",
+      quotedBody,
+      showQuoted: false,
+    });
 
     const { data, error } = await mail
       .from("drafts")
@@ -277,20 +425,70 @@
         to_addresses: [],
         cc_addresses: [],
         subject,
-        body_text: body,
+        body_text: bodyText,
         generated_by_ai: false,
         status: "draft",
       })
-      .select("id,subject,body_text")
+      .select("id")
       .single();
     if (error) { alert(`下書き作成失敗: ${error.message}`); return; }
-    draft = { id: data!.id, subject: data!.subject ?? subject, body_text: data!.body_text ?? body };
+
+    compose = {
+      id: data!.id,
+      mode: "forward",
+      sourceMessageId: src.id,
+      subject,
+      to: [],
+      cc: [],
+      userBody: "",
+      quotedBody,
+      showQuoted: true,
+    };
+  }
+
+  // スレッドホバー時の「転送」: スレッドを開かずに最後の inbound メッセージを転送
+  async function forwardThread(t: Thread, e: Event) {
+    e.stopPropagation();
+    await openThread(t);
+    const lastInbound = [...messages].reverse().find((m) => m.direction === "inbound");
+    if (lastInbound) {
+      await startForward(lastInbound.id);
+    }
+  }
+
+  async function trashThread(t: Thread, e: Event) {
+    e.stopPropagation();
+    if (!confirm(`「${t.subject_normalized || "(件名なし)"}」をゴミ箱へ移動しますか？`)) return;
+    // 楽観的に UI から消す
+    const prev = threads;
+    threads = threads.filter((x) => x.id !== t.id);
+    if (selectedThreadId === t.id) {
+      selectedThreadId = null;
+      messages = [];
+      compose = null;
+    }
+    const { error } = await mail
+      .from("threads")
+      .update({ trashed_at: new Date().toISOString() })
+      .eq("id", t.id);
+    if (error) {
+      alert(`削除失敗: ${error.message}\n(migration 20260422000007 を SQL Editor で適用してください)`);
+      threads = prev;
+    }
+  }
+
+  async function cancelCompose() {
+    if (!compose) return;
+    if (compose.userBody.trim() !== "") {
+      if (!confirm("編集中の内容を破棄しますか？")) return;
+    }
+    await mail.from("drafts").update({ status: "discarded" }).eq("id", compose.id);
+    compose = null;
   }
 
   async function generateDraft() {
     if (!selectedMessageId) return;
     generating = true;
-    draft = null;
     try {
       const res = await fetch(fnUrl("generate-draft"), {
         method: "POST",
@@ -299,7 +497,20 @@
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "failed");
-      draft = { id: json.draft_id, subject: json.subject, body_text: json.body_text };
+      // AI 下書きは返信モードとして inline 展開する
+      const src = messages.find((m) => m.id === selectedMessageId);
+      const quotedBody = src ? buildQuoted(src) : "";
+      compose = {
+        id: json.draft_id,
+        mode: "reply",
+        sourceMessageId: selectedMessageId!,
+        subject: json.subject ?? "",
+        to: src?.from_address ? [src.from_address] : [],
+        cc: [],
+        userBody: json.body_text ?? "",
+        quotedBody,
+        showQuoted: false,
+      };
     } catch (e) {
       alert(`下書き生成失敗: ${(e as Error).message}`);
     } finally {
@@ -307,29 +518,35 @@
     }
   }
 
-  async function saveDraftEdits() {
-    if (!draft) return;
+  async function saveCompose() {
+    if (!compose) return;
     await mail
       .from("drafts")
-      .update({ subject: draft.subject, body_text: draft.body_text })
-      .eq("id", draft.id);
+      .update({
+        subject: compose.subject,
+        body_text: assembleBody(compose),
+        to_addresses: compose.to,
+        cc_addresses: compose.cc,
+      })
+      .eq("id", compose.id);
   }
 
-  async function sendDraft() {
-    if (!draft) return;
-    if (!confirm("この下書きで送信しますか？")) return;
+  async function sendCompose() {
+    if (!compose) return;
+    if (compose.to.length === 0) { alert("宛先を入力してください"); return; }
+    if (!confirm("この内容で送信しますか？")) return;
     sending = true;
     try {
-      await saveDraftEdits();
+      await saveCompose();
       const res = await fetch(fnUrl("send-mail"), {
         method: "POST",
         headers: { "content-type": "application/json", ...(await authHeader()) },
-        body: JSON.stringify({ draft_id: draft.id }),
+        body: JSON.stringify({ draft_id: compose.id }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "failed");
       alert("送信しました");
-      draft = null;
+      compose = null;
       if (selectedThreadId) {
         const t = threads.find((x) => x.id === selectedThreadId);
         if (t) await openThread(t);
@@ -343,14 +560,12 @@
 
   async function markRead(messageId: string) {
     if (!userId) return;
-    // upsert でなく insert + 重複無視 (mail.message_reads は UPDATE ポリシー未定義)
     await mail
       .from("message_reads")
       .upsert(
         { message_id: messageId, user_id: userId },
         { onConflict: "message_id,user_id", ignoreDuplicates: true },
       );
-    // ローカル未読カウントをスレッド・アカウントの両方で即座に減らす
     const msg = messages.find((m) => m.id === messageId);
     const accountId = msg?.account_id;
     if (selectedThreadId) {
@@ -367,6 +582,22 @@
           : a,
       );
     }
+  }
+
+  // 相対時刻表示 ("1 分前", "たった今")。nowTick を参照して 30s 毎に更新。
+  function formatRelative(ts: number | null): string {
+    if (!ts) return "未同期";
+    void nowTick;
+    const diff = Math.max(0, Date.now() - ts);
+    if (diff < 10_000) return "たった今";
+    if (diff < 60_000) return `${Math.floor(diff / 1000)} 秒前`;
+    if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分前`;
+    return `${Math.floor(diff / 3600_000)} 時間前`;
+  }
+
+  // 宛先入力のパース
+  function parseAddrs(s: string): string[] {
+    return s.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
   }
 </script>
 
@@ -401,34 +632,68 @@
       </button>
     {/each}
     <div class="accounts-footer">
-      <button class="reload" onclick={() => { void syncTick(); loadThreads(); }} title="再同期">
-        {syncing ? "同期中..." : "↻ 再同期"}
+      <button
+        class="reload"
+        onclick={() => { void syncTick(); }}
+        disabled={syncing}
+        title={syncError ? `前回エラー: ${syncError}` : "IMAP 再同期"}
+      >
+        {#if syncing}
+          <span class="spinner" aria-hidden="true"></span>
+          同期中…
+        {:else if syncError}
+          ⚠ {syncError} (再試行)
+        {:else}
+          ↻ 再同期
+        {/if}
       </button>
+      <div class="sync-info" class:error={!!syncError}>
+        最終同期: {formatRelative(lastSyncedAt)}
+      </div>
     </div>
   </aside>
+
   <aside class="threads">
     {#each filtered as t (t.id)}
-      <button
-        class="thread"
+      <div
+        class="thread-row"
         class:selected={selectedThreadId === t.id}
         class:unread={(t.unread_count ?? 0) > 0}
         class:arrived={newThreadIds.has(t.id)}
-        onclick={() => openThread(t)}
+        onmouseenter={() => (hoverThreadId = t.id)}
+        onmouseleave={() => (hoverThreadId = null)}
+        role="presentation"
       >
-        <div class="meta">
-          <span class="label">{t.account_label ?? ""}</span>
-          <span class="date">
-            {new Date(t.last_message_at).toLocaleDateString("ja-JP")}
-          </span>
-        </div>
-        <div class="subject">
-          {#if (t.unread_count ?? 0) > 0}
-            <span class="badge">{t.unread_count}</span>
-          {/if}
-          {t.subject_normalized || "(件名なし)"}
-        </div>
-        <div class="participants">{t.participants.slice(0, 2).join(", ")}</div>
-      </button>
+        <button class="thread" onclick={() => openThread(t)}>
+          <div class="meta">
+            <span class="label">{t.account_label ?? ""}</span>
+            <span class="date">
+              {new Date(t.last_message_at).toLocaleDateString("ja-JP")}
+            </span>
+          </div>
+          <div class="subject">
+            {#if (t.unread_count ?? 0) > 0}
+              <span class="badge">{t.unread_count}</span>
+            {/if}
+            {t.subject_normalized || "(件名なし)"}
+          </div>
+          <div class="participants">{t.participants.slice(0, 2).join(", ")}</div>
+        </button>
+        {#if hoverThreadId === t.id}
+          <div class="thread-actions">
+            <button
+              class="act-btn"
+              title="転送"
+              onclick={(e) => forwardThread(t, e)}
+            >→</button>
+            <button
+              class="act-btn danger"
+              title="削除"
+              onclick={(e) => trashThread(t, e)}
+            >🗑</button>
+          </div>
+        {/if}
+      </div>
     {/each}
     {#if filtered.length === 0}
       <p class="empty-list">スレッドがありません</p>
@@ -436,22 +701,108 @@
   </aside>
 
   <section class="detail">
-    {#if messages.length === 0}
+    {#if messages.length === 0 && !compose}
       <p class="empty">スレッドを選択してください</p>
+    {:else if compose}
+      <!-- ===== 返信/転送インライン展開 ===== -->
+      <header class="compose-header">
+        <button class="back" onclick={cancelCompose} title="キャンセル">← 戻る</button>
+        <span class="compose-mode">
+          {compose.mode === "reply" ? "↩ 返信を作成" : "→ 転送を作成"}
+        </span>
+        <span class="spacer"></span>
+        <button
+          class="ai"
+          onclick={generateDraft}
+          disabled={generating || compose.mode !== "reply"}
+          title="Claude で再生成"
+        >
+          {generating ? "生成中…" : "✨ Claude 再生成"}
+        </button>
+      </header>
+      <div class="compose">
+        <div class="field-row">
+          <label class="field">
+            <span>To</span>
+            <input
+              type="text"
+              value={compose.to.join(", ")}
+              oninput={(e) => (compose!.to = parseAddrs((e.target as HTMLInputElement).value))}
+              placeholder="宛先を入力 (カンマ区切り)"
+            />
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>Cc</span>
+            <input
+              type="text"
+              value={compose.cc.join(", ")}
+              oninput={(e) => (compose!.cc = parseAddrs((e.target as HTMLInputElement).value))}
+              placeholder="Cc (任意)"
+            />
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>件名</span>
+            <input type="text" bind:value={compose.subject} />
+          </label>
+        </div>
+        <textarea
+          class="user-body"
+          rows="10"
+          bind:value={compose.userBody}
+          placeholder={compose.mode === "reply" ? "返信を入力…" : "転送コメントを入力 (任意)"}
+        ></textarea>
+
+        {#if compose.quotedBody}
+          <div class="quoted-toggle">
+            <button
+              type="button"
+              class="qbtn"
+              onclick={() => (compose!.showQuoted = !compose!.showQuoted)}
+            >
+              {compose.showQuoted ? "▲ 引用を隠す" : "▼ 引用を表示 (全文付きで送信されます)"}
+            </button>
+          </div>
+          {#if compose.showQuoted}
+            <pre class="quoted-body">{compose.quotedBody}</pre>
+          {/if}
+        {/if}
+
+        <details class="tone">
+          <summary>Claude 再生成時のトーン指示</summary>
+          <input
+            type="text"
+            placeholder="例: 丁寧に、簡潔に、提案を含めて"
+            bind:value={hint}
+          />
+        </details>
+
+        <div class="compose-actions">
+          <button onclick={cancelCompose}>破棄</button>
+          <button onclick={saveCompose}>下書き保存</button>
+          <button class="primary" onclick={sendCompose} disabled={sending}>
+            {sending ? "送信中…" : "送信"}
+          </button>
+        </div>
+      </div>
     {:else}
+      <!-- ===== スレッド表示 ===== -->
       <header class="detail-toolbar">
-        <button onclick={() => startManualReply(false)} disabled={!selectedMessageId}>
+        <button onclick={() => startReply(false)} disabled={!selectedMessageId}>
           ↩ 返信
         </button>
-        <button onclick={() => startManualReply(true)} disabled={!selectedMessageId}>
+        <button onclick={() => startReply(true)} disabled={!selectedMessageId}>
           ↩↩ 全員に返信
         </button>
-        <button onclick={startForward} disabled={!selectedMessageId}>
+        <button onclick={() => startForward()} disabled={!selectedMessageId}>
           → 転送
         </button>
         <span class="spacer"></span>
         <button onclick={generateDraft} disabled={generating || !selectedMessageId}>
-          {generating ? "生成中..." : "✨ Claude 下書き"}
+          {generating ? "生成中…" : "✨ Claude 下書き"}
         </button>
       </header>
       {#each messages as m}
@@ -472,28 +823,6 @@
           <pre>{m.body_text ?? ""}</pre>
         </div>
       {/each}
-
-      <div class="draft-panel">
-        <details>
-          <summary>Claude の下書きにトーン指示を渡す</summary>
-          <input
-            type="text"
-            placeholder="トーン指示 (例: 丁寧に、簡潔に、提案を含めて)"
-            bind:value={hint}
-          />
-        </details>
-
-        {#if draft}
-          <input type="text" bind:value={draft.subject} />
-          <textarea rows="12" bind:value={draft.body_text}></textarea>
-          <div class="actions">
-            <button onclick={saveDraftEdits}>保存</button>
-            <button class="primary" onclick={sendDraft} disabled={sending}>
-              {sending ? "送信中..." : "送信"}
-            </button>
-          </div>
-        {/if}
-      </div>
     {/if}
   </section>
 </div>
@@ -533,33 +862,20 @@
     font-weight: 600;
     color: #111;
   }
-  .account .grip {
-    color: #9ca3af;
-    font-size: 0.7rem;
-    cursor: grab;
-    user-select: none;
-  }
+  .account .grip { color: #9ca3af; font-size: 0.7rem; cursor: grab; user-select: none; }
   .account-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .shared-badge {
-    background: #dbeafe;
-    color: #1e40af;
-    font-size: 0.7rem;
-    padding: 0.1rem 0.3rem;
-    border-radius: 3px;
-  }
+  .shared-badge { background: #dbeafe; color: #1e40af; font-size: 0.7rem; padding: 0.1rem 0.3rem; border-radius: 3px; }
   .account-unread {
-    background: #ef4444;
-    color: #fff;
-    font-size: 0.7rem;
-    font-weight: 700;
-    padding: 0.1rem 0.4rem;
-    border-radius: 9px;
-    min-width: 1.4rem;
-    text-align: center;
+    background: #ef4444; color: #fff; font-size: 0.7rem; font-weight: 700;
+    padding: 0.1rem 0.4rem; border-radius: 9px; min-width: 1.4rem; text-align: center;
   }
   .accounts-footer { margin-top: auto; padding-top: 0.5rem; }
   .accounts-footer .reload {
     width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
     background: #fff;
     border: 1px solid #d1d5db;
     border-radius: 4px;
@@ -567,27 +883,48 @@
     font-size: 0.8rem;
     cursor: pointer;
   }
-  .accounts-footer .reload:hover { background: #f9fafb; }
+  .accounts-footer .reload:hover:not(:disabled) { background: #f9fafb; }
+  .accounts-footer .reload:disabled { opacity: 0.7; cursor: wait; }
+  .sync-info {
+    font-size: 0.7rem;
+    color: #6b7280;
+    text-align: center;
+    margin-top: 0.25rem;
+  }
+  .sync-info.error { color: #b45309; }
+  .spinner {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 2px solid #d1d5db;
+    border-top-color: #2563eb;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   .threads {
     overflow-y: auto;
     border-right: 1px solid #e5e7eb;
     background: #fff;
+  }
+  .thread-row {
+    position: relative;
+    border-bottom: 1px solid #f0f0f0;
   }
   .thread {
     display: block;
     width: 100%;
     text-align: left;
     padding: 0.75rem 1rem;
+    padding-right: 4.5rem; /* hover ボタン分の余白 */
     background: transparent;
     border: none;
-    border-bottom: 1px solid #f0f0f0;
     cursor: pointer;
   }
-  .thread:hover { background: #f9fafb; }
-  .thread.selected { background: #eff6ff; }
-  .thread.unread .subject { font-weight: 700; }
-  /* Outlook 風の新着アニメーション: 上からスライドイン + 黄色ハイライトがフェードアウト */
-  .thread.arrived {
+  .thread-row:hover { background: #f9fafb; }
+  .thread-row.selected { background: #eff6ff; }
+  .thread-row.unread .subject { font-weight: 700; }
+  .thread-row.arrived {
     animation: threadArrive 600ms ease-out, threadHighlight 2.8s ease-out 600ms;
   }
   @keyframes threadArrive {
@@ -598,6 +935,32 @@
     0% { background: #fef3c7; }
     100% { background: transparent; }
   }
+  .thread-actions {
+    position: absolute;
+    top: 50%;
+    right: 0.5rem;
+    transform: translateY(-50%);
+    display: flex;
+    gap: 0.25rem;
+    z-index: 1;
+  }
+  .act-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    font-size: 0.85rem;
+    cursor: pointer;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  }
+  .act-btn:hover { background: #f3f4f6; border-color: #9ca3af; }
+  .act-btn.danger:hover { background: #fee2e2; border-color: #fca5a5; color: #b91c1c; }
+
   .badge {
     display: inline-block;
     background: #2563eb;
@@ -607,39 +970,19 @@
     border-radius: 10px;
     margin-right: 0.25rem;
   }
-  .meta {
-    display: flex;
-    justify-content: space-between;
-    font-size: 0.75rem;
-    color: #666;
-  }
-  .label {
-    background: #e0e7ff;
-    color: #3730a3;
-    padding: 0.1rem 0.4rem;
-    border-radius: 3px;
-  }
-  .subject {
-    font-weight: 600;
-    margin: 0.25rem 0;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
+  .meta { display: flex; justify-content: space-between; font-size: 0.75rem; color: #666; }
+  .label { background: #e0e7ff; color: #3730a3; padding: 0.1rem 0.4rem; border-radius: 3px; }
+  .subject { font-weight: 600; margin: 0.25rem 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .participants { font-size: 0.8rem; color: #666; }
   .empty-list { color: #999; padding: 1rem; text-align: center; font-size: 0.9rem; }
+
   .detail { overflow-y: auto; padding: 0; }
-  .detail .message,
-  .detail .draft-panel { margin-left: 1rem; margin-right: 1rem; }
+  .detail .message { margin-left: 1rem; margin-right: 1rem; }
   .detail .message:first-of-type { margin-top: 1rem; }
   .empty { color: #999; text-align: center; margin-top: 4rem; padding: 0 1rem; }
   .detail-toolbar {
-    position: sticky;
-    top: 0;
-    z-index: 2;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
+    position: sticky; top: 0; z-index: 2;
+    display: flex; align-items: center; gap: 0.5rem;
     padding: 0.6rem 1rem;
     background: #fff;
     border-bottom: 1px solid #e5e7eb;
@@ -665,12 +1008,7 @@
   }
   .message.outbound { background: #f0f9ff; }
   .message.active { border-color: #2563eb; }
-  .message header {
-    display: flex;
-    justify-content: space-between;
-    font-size: 0.85rem;
-    color: #666;
-  }
+  .message header { display: flex; justify-content: space-between; font-size: 0.85rem; color: #666; }
   .message h3 { margin: 0.5rem 0; font-size: 1rem; }
   .message pre {
     white-space: pre-wrap;
@@ -680,31 +1018,145 @@
     font-size: 0.92rem;
     line-height: 1.6;
   }
-  .draft-panel {
+
+  /* ===== Compose (inline reply/forward) ===== */
+  .compose-header {
+    position: sticky; top: 0; z-index: 2;
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.6rem 1rem;
     background: #fff;
-    border: 1px solid #e5e7eb;
-    border-radius: 6px;
-    padding: 1rem;
-    margin-top: 1rem;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  .compose-header .back {
+    padding: 0.35rem 0.6rem;
+    border: 1px solid #d1d5db;
+    background: #fff; border-radius: 4px; cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .compose-header .back:hover { background: #f3f4f6; }
+  .compose-header .compose-mode {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #111;
+  }
+  .compose-header .spacer { flex: 1; }
+  .compose-header .ai {
+    padding: 0.35rem 0.7rem;
+    border: 1px solid #c7d2fe;
+    background: #eef2ff;
+    color: #3730a3;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .compose-header .ai:hover:not(:disabled) { background: #e0e7ff; }
+  .compose-header .ai:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .compose {
+    padding: 1rem 1.25rem 2rem;
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 0.6rem;
+    max-width: 880px;
   }
-  .draft-panel h3 { margin: 0; }
-  .reply-buttons { display: flex; gap: 0.5rem; }
-  .reply-buttons button { padding: 0.5rem 1rem; }
-  .draft-panel details { background: #f9fafb; padding: 0.5rem 0.75rem; border-radius: 4px; }
-  .draft-panel details summary { cursor: pointer; font-size: 0.85rem; color: #374151; }
-  .draft-panel details > input,
-  .draft-panel details > button { margin-top: 0.5rem; width: 100%; }
-  .draft-panel input, .draft-panel textarea {
-    padding: 0.5rem;
-    border: 1px solid #d1d5db;
-    border-radius: 4px;
+  .field-row { display: flex; }
+  .field {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    gap: 0.5rem;
+    border-bottom: 1px solid #e5e7eb;
+    padding: 0.35rem 0;
+  }
+  .field > span {
+    width: 3rem;
+    font-size: 0.8rem;
+    color: #6b7280;
+    flex-shrink: 0;
+  }
+  .field > input {
+    flex: 1;
+    border: none;
+    padding: 0.35rem 0;
     font-size: 0.95rem;
     font-family: inherit;
+    outline: none;
+    background: transparent;
   }
-  .actions { display: flex; gap: 0.5rem; }
-  .actions button { padding: 0.5rem 1rem; }
-  .primary { background: #2563eb; color: #fff; border: none; }
+  .user-body {
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    padding: 0.75rem;
+    font-size: 0.95rem;
+    font-family: inherit;
+    line-height: 1.6;
+    resize: vertical;
+    min-height: 160px;
+    margin-top: 0.5rem;
+  }
+  .user-body:focus { outline: 2px solid #bfdbfe; border-color: #60a5fa; }
+
+  .quoted-toggle { margin-top: 0.25rem; }
+  .qbtn {
+    background: transparent;
+    border: none;
+    color: #6b7280;
+    font-size: 0.8rem;
+    cursor: pointer;
+    padding: 0.25rem 0;
+  }
+  .qbtn:hover { color: #374151; }
+  .quoted-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    font-size: 0.88rem;
+    line-height: 1.6;
+    color: #6b7280;
+    border-left: 3px solid #e5e7eb;
+    padding: 0.5rem 0.75rem;
+    margin: 0;
+    background: #fafafa;
+    border-radius: 0 4px 4px 0;
+  }
+
+  .tone {
+    background: #f9fafb;
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+  }
+  .tone summary { cursor: pointer; color: #374151; }
+  .tone input {
+    margin-top: 0.5rem;
+    width: 100%;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    font-family: inherit;
+  }
+
+  .compose-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    justify-content: flex-end;
+  }
+  .compose-actions button {
+    padding: 0.5rem 1.25rem;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  .compose-actions button:hover:not(:disabled) { background: #f3f4f6; }
+  .compose-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .compose-actions .primary {
+    background: #2563eb;
+    color: #fff;
+    border: none;
+  }
+  .compose-actions .primary:hover:not(:disabled) { background: #1d4ed8; }
 </style>

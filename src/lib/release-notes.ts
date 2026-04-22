@@ -6,6 +6,17 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.5.0",
+    date: "2026-04-22",
+    changes: [
+      "Gmail ライクなリアルタイム UX: Supabase Realtime で mail.messages の INSERT を購読 + 15 秒ごとの軽量 DB poll で新着メールを即時反映",
+      "「同期中…」表示の hang を解消: imap-sync に 45 秒タイムアウト (AbortController) を付け、前回同期時刻「X 分前」とエラー内容を footer に表示",
+      "スレッド一覧にホバーアクション追加: マウスを乗せると右端に「転送」「削除」ボタンが出現、削除はゴミ箱へソフトデリート (mail.threads.trashed_at)",
+      "返信/転送 UI を gmail 風インライン展開に刷新: 元メール本文エリアを返信コンポーズ (To/Cc/件名/本文 + 折りたたみ引用) に置き換え、全文引用で送信",
+      "Claude 再生成をコンポーズ画面内に統合: トーン指示を入れて ✨ ボタン 1 つで本文だけ差し替え、引用はそのまま維持",
+    ],
+  },
+  {
     version: "0.4.3",
     date: "2026-04-22",
     changes: [
