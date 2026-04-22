@@ -571,38 +571,46 @@
     await loadThreads();
   }
 
-  // Svelte action: タッチ左スワイプで削除を発火する。
-  // - 垂直スクロール優先判定付き (最初の 8px で horizontal/vertical を確定)
-  // - 閾値 (-100px) を超えたら card を -110% にスライドさせて onSwipe を呼ぶ
+  // Svelte action: 左スワイプ (タッチ) / 左ドラッグ (マウス) で削除を発火する。
+  // Pointer Events に統一して iOS/Android のタッチと Mac/Win のマウスを両方サポート。
+  // - 最初の 8px で horizontal/vertical を確定 (縦スクロール優先)
+  // - horizontal と決まったら setPointerCapture して枠外でも追従
+  // - 閾値 (-100px) 越えで card を -110% にスライドアウト → onSwipe 発火
   // - それ以外は元位置に戻す
+  // クリック誤爆防止: 8px 未満の動きでは active を解除せず、button の click は通常通り発火。
   function swipeable(
     node: HTMLElement,
     params: { threshold: number; onSwipe: () => void },
   ) {
     let startX = 0, startY = 0;
     let active = false, decided = false, horizontal = false;
+    let pid: number | null = null;
+    let suppressClick = false;
     const threshold = params.threshold;
 
     const bgEl = (): HTMLElement | null =>
       node.parentElement?.querySelector(".swipe-bg") ?? null;
 
-    const onStart = (e: TouchEvent) => {
-      if (e.touches.length !== 1) return;
-      const t = e.touches[0];
-      startX = t.clientX; startY = t.clientY;
+    const onDown = (e: PointerEvent) => {
+      // マウスは左ボタンのみ。ペン/タッチはそのまま。
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      startX = e.clientX; startY = e.clientY;
       active = true; decided = false; horizontal = false;
+      pid = e.pointerId;
+      suppressClick = false;
       node.style.transition = "none";
     };
-    const onMove = (e: TouchEvent) => {
-      if (!active) return;
-      const t = e.touches[0];
-      const dx = t.clientX - startX;
-      const dy = t.clientY - startY;
+    const onMove = (e: PointerEvent) => {
+      if (!active || e.pointerId !== pid) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
       if (!decided) {
         if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
         horizontal = Math.abs(dx) > Math.abs(dy);
         decided = true;
         if (!horizontal) { active = false; return; }
+        try { node.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+        suppressClick = true; // 水平ドラッグ確定後の click は抑止
       }
       e.preventDefault();
       const off = Math.min(0, dx);
@@ -613,8 +621,8 @@
         bg.style.opacity = String(0.25 + ratio * 0.75);
       }
     };
-    const onEnd = () => {
-      if (!active) return;
+    const onUp = (e: PointerEvent) => {
+      if (!active || e.pointerId !== pid) return;
       active = false;
       const m = node.style.transform.match(/-?\d+(\.\d+)?/);
       const off = m ? parseFloat(m[0]) : 0;
@@ -627,19 +635,32 @@
         node.style.transform = "";
         if (bg) bg.style.opacity = "";
       }
+      try { node.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+      pid = null;
     };
 
-    node.addEventListener("touchstart", onStart, { passive: true });
-    node.addEventListener("touchmove", onMove, { passive: false });
-    node.addEventListener("touchend", onEnd);
-    node.addEventListener("touchcancel", onEnd);
+    // ドラッグ後の click (button onclick) がスレッドを開いてしまうのを抑止
+    const onClickCapture = (e: MouseEvent) => {
+      if (suppressClick) {
+        e.stopPropagation();
+        e.preventDefault();
+        suppressClick = false;
+      }
+    };
+
+    node.addEventListener("pointerdown", onDown);
+    node.addEventListener("pointermove", onMove);
+    node.addEventListener("pointerup", onUp);
+    node.addEventListener("pointercancel", onUp);
+    node.addEventListener("click", onClickCapture, true);
 
     return {
       destroy() {
-        node.removeEventListener("touchstart", onStart);
-        node.removeEventListener("touchmove", onMove);
-        node.removeEventListener("touchend", onEnd);
-        node.removeEventListener("touchcancel", onEnd);
+        node.removeEventListener("pointerdown", onDown);
+        node.removeEventListener("pointermove", onMove);
+        node.removeEventListener("pointerup", onUp);
+        node.removeEventListener("pointercancel", onUp);
+        node.removeEventListener("click", onClickCapture, true);
       },
     };
   }
@@ -1249,6 +1270,9 @@
     background: #fff;
     touch-action: pan-y;
     will-change: transform;
+    /* ドラッグ中のテキスト選択を抑止 */
+    user-select: none;
+    -webkit-user-select: none;
   }
   .thread {
     display: block;

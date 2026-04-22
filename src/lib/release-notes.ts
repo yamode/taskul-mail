@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.7.1",
+    date: "2026-04-22",
+    changes: [
+      "スワイプ削除を Pointer Events に統一: Mac/Windows のマウスによる左ドラッグでも削除できるようになった (iPhone/iPad のタッチは従来どおり)",
+      "水平ドラッグ確定後の click 抑止を追加: ドラッグ終了時にスレッドが意図せず開く誤動作を防止",
+      "setPointerCapture でサイドバー外にカーソルが出ても追従、user-select: none でドラッグ中のテキスト選択も抑止",
+    ],
+  },
+  {
     version: "0.7.0",
     date: "2026-04-22",
     changes: [
