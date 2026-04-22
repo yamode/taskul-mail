@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.8.2",
+    date: "2026-04-22",
+    changes: [
+      "imap-sync: fetchOne タイムアウト後は break でなく continue に変更 (他の UID は取得を試みる)",
+      "連続 3 件失敗したら run を打ち切り (imapflow の状態破損を想定)",
+      "forward モードでスキップした UID は last_uid を前進させる (同じ壊れた UID で無限ループするのを防止、失ったメッセージはログに PERMANENT_SKIP で記録)",
+    ],
+  },
+  {
     version: "0.8.1",
     date: "2026-04-22",
     changes: [

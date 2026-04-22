@@ -241,12 +241,15 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     diag.target_uid_count = targetUids.length;
 
     // 全モードで SEARCH → fetchOne 統一 (range fetch は一切使わない)
-    // 個々の fetchOne に 15 秒の wall-clock タイムアウトを付ける。
-    // 特定の壊れた/巨大メッセージで imapflow が永久待ち状態になっても、
-    // この 1 通だけスキップして先に進める (該当 UID は次回の sync でリトライ)。
+    // 個々の fetchOne に 15 秒タイムアウト、失敗時はスキップして次へ。
+    // 連続 3 件スキップしたら imapflow の状態が壊れた可能性が高いので打ち切り。
+    // スキップした UID は maxSeenUid に反映して last_uid を前進させる
+    // (そうしないと次回も同じ UID で失敗する無限ループに陥る)。
     const FETCH_TIMEOUT_MS = 15_000;
+    const MAX_CONSECUTIVE_SKIPS = 3;
     const skippedUids: number[] = [];
     const fetchIter = (async function* () {
+      let consecutiveSkips = 0;
       for (let i = 0; i < targetUids.length; i++) {
         const uid = targetUids[i];
         console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} begin`);
@@ -262,13 +265,17 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
             ),
           ]);
           console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} end gotSrc=${!!(one as { source?: unknown })?.source}`);
+          consecutiveSkips = 0;
           if (one) yield one as never;
         } catch (e) {
-          console.warn(`[${account.email_address}] fetchOne uid=${uid} FAILED: ${(e as Error).message}`);
+          console.warn(`[${account.email_address}] fetchOne uid=${uid} PERMANENT_SKIP: ${(e as Error).message}`);
           skippedUids.push(uid);
-          // タイムアウト後は imapflow の内部状態が壊れている可能性が高いので
-          // このアカウントの同期はここで打ち切り、次回以降にリトライする。
-          break;
+          consecutiveSkips++;
+          if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
+            console.warn(`[${account.email_address}] ${consecutiveSkips} consecutive skips — aborting this run`);
+            break;
+          }
+          // continue to next UID
         }
       }
     })();
@@ -401,6 +408,18 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       }
     }
     console.log(`[${account.email_address}] FETCH LOOP DONE processed=${processed} skipped=${skippedUids.length}`);
+
+    // forward モードではスキップした UID も maxSeenUid に反映。
+    // こうしないと next run で同じ UID を再試行して永久ループするため。
+    // (backfill モードでは、スキップした UID は oldestSyncedUid より古いため
+    //  last_uid には影響しない)
+    if (mode === "forward" && skippedUids.length > 0) {
+      const maxSkipped = Math.max(...skippedUids);
+      if (maxSkipped > maxSeenUid) {
+        console.warn(`[${account.email_address}] advancing maxSeenUid past skipped UIDs: ${maxSeenUid} -> ${maxSkipped}`);
+        maxSeenUid = maxSkipped;
+      }
+    }
 
     // 触ったスレッドの message_count と last_message_at をまとめて更新
     for (const [tid, lastAt] of touchedThreads) {
