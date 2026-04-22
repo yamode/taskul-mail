@@ -175,12 +175,15 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
 
     // 同期モード判定:
     // - first: まだ何も同期していない → sequence 末尾から N 件
-    // - forward: 新着あり (actualMaxUid > last_uid) → UID の forward 範囲
-    // - backfill: 過去メールが未取得 (oldestSyncedUid > 1) → UID の backfill 範囲
+    // - forward: 新着あり → UID の forward 範囲
+    // - backfill: 過去メール未取得 → SEARCH で UID 列挙 → 新しい順 N 件だけ fetch
+    //   (大きな範囲を fetch すると imapflow の iterator がハングするため
+    //    対象 UID を SEARCH で絞ってからピンポイント fetch する)
     // - idle: 同期済み
     let mode: "first" | "forward" | "backfill" | "idle";
     let fetchRange: string | null = null;
     let isSeqRange = false;
+    let backfillUids: number[] = [];
 
     if (effectiveLastUid === 0 && oldestSyncedUid === null) {
       mode = "first";
@@ -194,13 +197,22 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       isSeqRange = false;
     } else if (oldestSyncedUid !== null && oldestSyncedUid > 1) {
       mode = "backfill";
-      fetchRange = `1:${oldestSyncedUid - 1}`;
+      const searchResult = await client.search(
+        { uid: `1:${oldestSyncedUid - 1}` },
+        { uid: true },
+      );
+      // search は UID の配列を返す。新しい順に並べ替えて先頭 N 件を取得対象に。
+      const allUids = (searchResult ?? []).map((u: unknown) => Number(u)).filter((n) => !isNaN(n));
+      allUids.sort((a, b) => b - a);
+      backfillUids = allUids.slice(0, MAX_PER_RUN);
+      fetchRange = backfillUids.length > 0 ? backfillUids.join(",") : null;
       isSeqRange = false;
     } else {
       mode = "idle";
     }
     diag.mode = mode;
     diag.fetch_range = fetchRange;
+    diag.backfill_total_uids = mode === "backfill" ? backfillUids.length : undefined;
     const isFirstSync = mode === "first";
 
     const fetchIter = fetchRange

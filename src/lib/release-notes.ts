@@ -6,6 +6,13 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.4.2",
+    date: "2026-04-22",
+    changes: [
+      "backfill 同期のハング修正: 大きな UID 範囲 (1:oldestUid-1) を直接 fetch すると imapflow の iterator が閉じないため、先に UID SEARCH で絞り込み、新しい順 30 件だけをピンポイント fetch する方式に変更",
+    ],
+  },
+  {
     version: "0.4.1",
     date: "2026-04-22",
     changes: [
