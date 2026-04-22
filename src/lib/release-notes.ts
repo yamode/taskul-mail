@@ -6,6 +6,14 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.4.1",
+    date: "2026-04-22",
+    changes: [
+      "既読操作でアカウントサイドバーの未読バッジもリアルタイムに減少させる",
+      "アカウントサイドバーの並びを ⋮⋮ / 共 / ラベル / 未読件数 の順に変更 (未読件数が右端に)",
+    ],
+  },
+  {
     version: "0.4.0",
     date: "2026-04-22",
     changes: [

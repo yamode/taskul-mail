@@ -350,12 +350,21 @@
         { message_id: messageId, user_id: userId },
         { onConflict: "message_id,user_id", ignoreDuplicates: true },
       );
-    // ローカル未読カウントを即座に減らす
+    // ローカル未読カウントをスレッド・アカウントの両方で即座に減らす
+    const msg = messages.find((m) => m.id === messageId);
+    const accountId = msg?.account_id;
     if (selectedThreadId) {
       threads = threads.map((t) =>
         t.id === selectedThreadId && (t.unread_count ?? 0) > 0
           ? { ...t, unread_count: (t.unread_count ?? 0) - 1 }
           : t,
+      );
+    }
+    if (accountId) {
+      accounts = accounts.map((a) =>
+        a.id === accountId && (a.unread_count ?? 0) > 0
+          ? { ...a, unread_count: (a.unread_count ?? 0) - 1 }
+          : a,
       );
     }
   }
@@ -382,10 +391,10 @@
         onclick={() => (filterAccountId = a.id)}
       >
         <span class="grip" title="ドラッグで並び替え">⋮⋮</span>
-        <span class="account-label">{a.label}</span>
         {#if a.is_shared}
           <span class="shared-badge" title="共有アカウント">共</span>
         {/if}
+        <span class="account-label">{a.label}</span>
         {#if (a.unread_count ?? 0) > 0}
           <span class="account-unread">{a.unread_count}</span>
         {/if}
