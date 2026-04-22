@@ -1,15 +1,19 @@
 # HANDOFF.md — taskul-mail
 
-> **最終更新**: 2026-04-23（VPS IDLE worker 稼働開始・Realtime 拡張・folders スキーマ基盤投入）
+> **最終更新**: 2026-04-23（v0.14.0 リリース: 検索バー・添付アイコン・本文空フォールバック・IMAP 削除同期 / dev→main force-push / カスタムドメイン準備）
 
 ## 現在地サマリ
 
-- 受信トレイ UI（アカウント縦リスト・D&D・未読バッジ・3カラム幅調整・sticky ヘッダ・メモパネル）完成して動作中
+- 受信トレイ UI（アカウント縦リスト・D&D・未読バッジ・3カラム幅調整・sticky ヘッダ・メモパネル・メインメニュー検索バー）完成して動作中
+- メール一覧に 📎 添付バッジ表示
 - IMAP 同期は **raw IMAP + mailparser** 方式に統一して安定稼働。imapflow の hang 問題は解決済み
 - 添付ファイル取得・表示も実装済み
+- 本文空フォールバック: body_html/body_text 両方空のときはパネル + 再取得ボタン表示、imap-sync 側も HTML→text 簡易変換/添付のみプレースホルダー
+- 削除の IMAP サーバ同期: `imap-trash` Edge Function で Trash フォルダへ UID MOVE (COPY+STORE+EXPUNGE フォールバック)。5 秒 undo 猶予後に commit
 - Supabase Realtime は `messages` / `threads` / `message_reads` / `drafts` / `folders` を購読。タブ未読バッジも動作
 - **VPS IDLE worker 本番稼働中**（`~/dev/taskul-mail/idle-worker/` で Docker Compose）。新着レイテンシ 60 秒 → 3 秒以下に改善
 - Cron (5 分毎) は IDLE のフォールバックとして継続稼働
+- dev → main force-push 済み。カスタムドメイン `taskul-mail.yamado.app` は Cloudflare Pages 側の手動設定待ち
 
 ## アーキテクチャ
 
@@ -65,29 +69,44 @@
 
 ## 作業ログ
 
-### 2026-04-23
+### 2026-04-23 (セッション2: v0.14.0 リリース)
 
 **実施内容:**
-- Realtime 購読拡張 (`message_reads` / `drafts` / `threads UPDATE`)、タブ未読バッジ追加
-- スレッド集約のフォールバック窓を 14 日 → 72 時間に短縮
-- `mail.folders` テーブル新設 + `messages.folder_id` 追加（Sent/Archive 対応の土台）
-- `docs/idle-design.md` 作成
-- インボックス UI 微調整: 削除ダイアログ廃止、3 カラム幅ドラッグ調整、返信/Claude 行も sticky、社内メモはメモ有り時のみ表示 + 返信行にメモボタン
-- VPS IDLE worker 実装（Node.js + imapflow + Docker Compose）— 本番稼働開始
-- アカウント行の spinner 削除（サイドバー下部に集約）
+- メインメニュー header に検索バー追加 (件名・差出人・参加者に部分一致、`?q=` URL 同期)
+- メール一覧に 📎 添付バッジ (スレッド内のいずれかのメッセージに添付があれば表示)
+- 本文空フォールバック: フロントで「本文を取得できませんでした」パネル + 再取得ボタン、imap-sync 側で HTML→text 簡易変換 / 添付のみメールのプレースホルダー自動生成
+- `imap-trash` Edge Function 新設 + `raw-imap.ts` に `moveToTrashRawImap` 追加 (MOVE 優先、未対応サーバは COPY+STORE+EXPUNGE)。5 秒 undo 猶予後に IMAP サーバ側 Trash へ commit。これで他メーラ/Webmail からも削除状態が揃う
+- CORS allowlist に `https://taskul-mail.yamado.app` 追加
+- `supabase/config.toml`: `imap-trash` も verify_jwt=false
+- **dev → main を force-push** (main は scaffold のみだった)
+- Edge Functions (`imap-trash` / `imap-sync`) を prod プロジェクトへデプロイ
+- **未完了 (手動作業)**: Cloudflare Pages Custom Domains に `taskul-mail.yamado.app` 追加 + Production branch が `main` になっているか確認
 
-**バージョン:** `v0.13.1`
+**バージョン:** `v0.14.0`
 
 **コミット:**
-- `a573afe` fix: [dev] idle-worker TS 型エラー修正 (v0.13.1)
-- `ddebb5a` feat: [dev] VPS IDLE worker 実装 + アカウント行 spinner 削除 (v0.13.0)
-- `9920652` fix: [dev] インボックス UI 微調整 (v0.12.1)
-- `0a09176` feat: [dev] Realtime 拡張 + folders スキーマ + IDLE 設計 (v0.12.0)
+- `5e96b36` chore: [dev] imap-trash verify_jwt=false + CORS に taskul-mail.yamado.app 追加
+- `dcbb530` feat: [dev] 検索バー/添付アイコン/本文空フォールバック/IMAP 削除同期 (v0.14.0)
 
 **残作業:**
+- Cloudflare Pages カスタムドメイン設定 (手動) → `taskul-mail.yamado.app`
+- CF Pages Production branch を main に設定 (まだなら)
 - Sent/Archive フォルダ同期の本体（imap-sync 多フォルダ + UI フォルダナビ）
 - VPS IDLE の 3 日並行運用で安定確認
 - 既存メッセージのスレッド再集約関数
+
+---
+
+### 2026-04-23 (セッション1: v0.13.x)
+
+**実施内容:**
+- Realtime 購読拡張 (`message_reads` / `drafts` / `threads UPDATE`)、タブ未読バッジ追加
+- `mail.folders` テーブル新設 + `messages.folder_id` 追加（Sent/Archive 対応の土台）
+- インボックス UI 微調整: 削除ダイアログ廃止、3 カラム幅ドラッグ調整、返信/Claude 行も sticky、社内メモはメモ有り時のみ表示 + 返信行にメモボタン
+- VPS IDLE worker 実装（Node.js + imapflow + Docker Compose）— 本番稼働開始、新着レイテンシ 3 秒以下
+- スレッド集約フォールバック窓を 14 日 → 72 時間に短縮
+
+**バージョン:** `v0.13.1`
 
 ## テストチェックリスト
 
