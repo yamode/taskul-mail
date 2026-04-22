@@ -316,9 +316,13 @@
 
   async function markRead(messageId: string) {
     if (!userId) return;
+    // upsert でなく insert + 重複無視 (mail.message_reads は UPDATE ポリシー未定義)
     await mail
       .from("message_reads")
-      .upsert({ message_id: messageId, user_id: userId });
+      .upsert(
+        { message_id: messageId, user_id: userId },
+        { onConflict: "message_id,user_id", ignoreDuplicates: true },
+      );
     // ローカル未読カウントを即座に減らす
     if (selectedThreadId) {
       threads = threads.map((t) =>

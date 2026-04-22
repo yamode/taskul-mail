@@ -6,6 +6,13 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.3.1",
+    date: "2026-04-22",
+    changes: [
+      "既読記録の 403 エラーを修正: mail.message_reads の upsert が UPDATE を試みてポリシー違反になっていたため、ignoreDuplicates で INSERT のみに変更",
+    ],
+  },
+  {
     version: "0.3.0",
     date: "2026-04-22",
     changes: [
