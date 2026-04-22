@@ -947,8 +947,16 @@
       node.style.transition = "none";
       wheelAccum += e.deltaX;
       updateVisual(-wheelAccum, wheelThreshold);
+      // 閾値を越えた時点で即発火 (ゆっくりスワイプでも確定させる)
+      if (-wheelAccum <= wheelThreshold) {
+        if (wheelTimer) { clearTimeout(wheelTimer); wheelTimer = null; }
+        wheelFinalize();
+        return;
+      }
+      // 閾値未達のまま無操作が続いた場合のみリセット。ゆっくりスワイプを
+      // 許容するために 500ms まで待つ。
       if (wheelTimer) clearTimeout(wheelTimer);
-      wheelTimer = setTimeout(wheelFinalize, 120);
+      wheelTimer = setTimeout(wheelFinalize, 500);
     };
 
     node.addEventListener("pointerdown", onDown);
