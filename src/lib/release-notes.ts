@@ -6,6 +6,13 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.5.1",
+    date: "2026-04-22",
+    changes: [
+      "返信/転送コンポーズの操作ボタン (破棄・下書き保存・送信・Claude 再生成・トーン指示) を sticky ヘッダーに集約。引用が長くてもスクロールせずに送信できる",
+    ],
+  },
+  {
     version: "0.5.0",
     date: "2026-04-22",
     changes: [

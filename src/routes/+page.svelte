@@ -706,19 +706,36 @@
     {:else if compose}
       <!-- ===== 返信/転送インライン展開 ===== -->
       <header class="compose-header">
-        <button class="back" onclick={cancelCompose} title="キャンセル">← 戻る</button>
-        <span class="compose-mode">
-          {compose.mode === "reply" ? "↩ 返信を作成" : "→ 転送を作成"}
-        </span>
-        <span class="spacer"></span>
-        <button
-          class="ai"
-          onclick={generateDraft}
-          disabled={generating || compose.mode !== "reply"}
-          title="Claude で再生成"
-        >
-          {generating ? "生成中…" : "✨ Claude 再生成"}
-        </button>
+        <div class="compose-header-row">
+          <button class="back" onclick={cancelCompose} title="キャンセル">← 戻る</button>
+          <span class="compose-mode">
+            {compose.mode === "reply" ? "↩ 返信を作成" : "→ 転送を作成"}
+          </span>
+          <span class="spacer"></span>
+          <button class="ghost" onclick={cancelCompose} title="下書きを破棄">破棄</button>
+          <button class="ghost" onclick={saveCompose} title="下書きとして保存">下書き保存</button>
+          <button class="primary" onclick={sendCompose} disabled={sending}>
+            {sending ? "送信中…" : "▶ 送信"}
+          </button>
+        </div>
+        <div class="compose-header-row tone-row">
+          <label class="tone-inline">
+            <span>Claude トーン</span>
+            <input
+              type="text"
+              placeholder="例: 丁寧に、簡潔に、提案を含めて (空欄可)"
+              bind:value={hint}
+            />
+          </label>
+          <button
+            class="ai"
+            onclick={generateDraft}
+            disabled={generating || compose.mode !== "reply"}
+            title="Claude で再生成"
+          >
+            {generating ? "生成中…" : "✨ 再生成"}
+          </button>
+        </div>
       </header>
       <div class="compose">
         <div class="field-row">
@@ -770,23 +787,6 @@
             <pre class="quoted-body">{compose.quotedBody}</pre>
           {/if}
         {/if}
-
-        <details class="tone">
-          <summary>Claude 再生成時のトーン指示</summary>
-          <input
-            type="text"
-            placeholder="例: 丁寧に、簡潔に、提案を含めて"
-            bind:value={hint}
-          />
-        </details>
-
-        <div class="compose-actions">
-          <button onclick={cancelCompose}>破棄</button>
-          <button onclick={saveCompose}>下書き保存</button>
-          <button class="primary" onclick={sendCompose} disabled={sending}>
-            {sending ? "送信中…" : "送信"}
-          </button>
-        </div>
       </div>
     {:else}
       <!-- ===== スレッド表示 ===== -->
@@ -1022,10 +1022,19 @@
   /* ===== Compose (inline reply/forward) ===== */
   .compose-header {
     position: sticky; top: 0; z-index: 2;
-    display: flex; align-items: center; gap: 0.5rem;
-    padding: 0.6rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    padding: 0.55rem 1rem;
     background: #fff;
     border-bottom: 1px solid #e5e7eb;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  }
+  .compose-header-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
   }
   .compose-header .back {
     padding: 0.35rem 0.6rem;
@@ -1039,7 +1048,29 @@
     font-weight: 600;
     color: #111;
   }
-  .compose-header .spacer { flex: 1; }
+  .compose-header .spacer { flex: 1; min-width: 0.5rem; }
+  .compose-header .ghost {
+    padding: 0.35rem 0.75rem;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: #374151;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .compose-header .ghost:hover:not(:disabled) { background: #f3f4f6; }
+  .compose-header .primary {
+    padding: 0.4rem 1rem;
+    border: none;
+    background: #2563eb;
+    color: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.88rem;
+    font-weight: 600;
+  }
+  .compose-header .primary:hover:not(:disabled) { background: #1d4ed8; }
+  .compose-header .primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .compose-header .ai {
     padding: 0.35rem 0.7rem;
     border: 1px solid #c7d2fe;
@@ -1048,9 +1079,35 @@
     border-radius: 4px;
     cursor: pointer;
     font-size: 0.85rem;
+    white-space: nowrap;
   }
   .compose-header .ai:hover:not(:disabled) { background: #e0e7ff; }
   .compose-header .ai:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .tone-row { background: #f9fafb; border-radius: 4px; padding: 0.3rem 0.5rem; }
+  .tone-inline {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex: 1;
+    min-width: 0;
+  }
+  .tone-inline > span {
+    font-size: 0.78rem;
+    color: #6b7280;
+    white-space: nowrap;
+  }
+  .tone-inline > input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid #e5e7eb;
+    background: #fff;
+    border-radius: 4px;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.85rem;
+    font-family: inherit;
+  }
+  .tone-inline > input:focus { outline: 2px solid #bfdbfe; border-color: #60a5fa; }
 
   .compose {
     padding: 1rem 1.25rem 2rem;
@@ -1120,43 +1177,4 @@
     border-radius: 0 4px 4px 0;
   }
 
-  .tone {
-    background: #f9fafb;
-    padding: 0.5rem 0.75rem;
-    border-radius: 4px;
-    font-size: 0.85rem;
-  }
-  .tone summary { cursor: pointer; color: #374151; }
-  .tone input {
-    margin-top: 0.5rem;
-    width: 100%;
-    padding: 0.4rem 0.5rem;
-    border: 1px solid #d1d5db;
-    border-radius: 4px;
-    font-size: 0.9rem;
-    font-family: inherit;
-  }
-
-  .compose-actions {
-    display: flex;
-    gap: 0.5rem;
-    margin-top: 0.5rem;
-    justify-content: flex-end;
-  }
-  .compose-actions button {
-    padding: 0.5rem 1.25rem;
-    border: 1px solid #d1d5db;
-    background: #fff;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 0.9rem;
-  }
-  .compose-actions button:hover:not(:disabled) { background: #f3f4f6; }
-  .compose-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .compose-actions .primary {
-    background: #2563eb;
-    color: #fff;
-    border: none;
-  }
-  .compose-actions .primary:hover:not(:disabled) { background: #1d4ed8; }
 </style>
