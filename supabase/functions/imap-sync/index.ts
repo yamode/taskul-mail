@@ -162,11 +162,12 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     const touchedThreads = new Map<string, string>();
 
     // 初回同期 (last_uid=0): sequence 末尾から MAX_PER_RUN 件。UID が飛び飛びでも確実に取れる。
-    // 差分同期 (last_uid>0): UID で `fromUid:*` を指定し、実在メッセージだけ取る。
+    // 差分同期 (last_uid>0): UID で `fromUid:actualMaxUid` を指定。
+    // (`fromUid:*` だと imapflow が FETCH OK を受け取れず iterator が閉じないサーバがある)
     const isFirstSync = effectiveLastUid === 0;
     const fetchRange = isFirstSync
       ? (exists > 0 ? `${Math.max(1, exists - MAX_PER_RUN + 1)}:${exists}` : null)
-      : `${fromUid}:*`;
+      : (actualMaxUid >= fromUid ? `${fromUid}:${actualMaxUid}` : null);
     diag.fetch_range = fetchRange;
     diag.is_first_sync = isFirstSync;
 
@@ -179,7 +180,7 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       : (async function* () {})();
     const shouldFetch = fetchRange !== null;
 
-    console.log(`[${account.email_address}] fetchRange=${fetchRange} isFirstSync=${isFirstSync} exists=${exists}`);
+    console.log(`[${account.email_address}] START fetchRange=${fetchRange} isFirstSync=${isFirstSync} exists=${exists} fromUid=${fromUid} actualMaxUid=${actualMaxUid}`);
     for await (const msg of fetchIter) {
       if (processed >= MAX_PER_RUN) break;
       processed++;
@@ -261,6 +262,7 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
         }
       }
 
+      console.log(`[${account.email_address}] thread resolved uid=${msg.uid}`);
       // メッセージ insert (重複は account_id+imap_uid の unique で弾く)
       const { error: mErr } = await sb.from("messages").upsert(
         {
@@ -286,15 +288,17 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
         { onConflict: "account_id,imap_uid" },
       );
       if (mErr) {
-        console.error("message insert failed", mErr);
+        console.error(`[${account.email_address}] message insert failed uid=${msg.uid}`, mErr);
         continue;
       }
+      console.log(`[${account.email_address}] upserted uid=${msg.uid}`);
 
       // last_message_at のみ更新 (件数集計は最後にまとめて)
       touchedThreads.set(threadId!, (parsed.date ?? new Date()).toISOString());
 
       if (Number(msg.uid) > maxSeenUid) maxSeenUid = Number(msg.uid);
     }
+    console.log(`[${account.email_address}] FETCH LOOP DONE processed=${processed}`);
 
     // 触ったスレッドの message_count と last_message_at をまとめて更新
     for (const [tid, lastAt] of touchedThreads) {
@@ -321,9 +325,11 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     diag.processed = processed;
     diag.hit_limit = processed >= MAX_PER_RUN;
     diag.max_seen_uid = maxSeenUid;
+    console.log(`[${account.email_address}] DONE processed=${processed} maxSeenUid=${maxSeenUid}`);
   } finally {
     lock.release();
-    await client.logout();
+    try { await client.logout(); } catch { /* ignore */ }
+    console.log(`[${account.email_address}] LOGOUT`);
   }
   return diag;
 }

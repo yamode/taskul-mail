@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.3.2",
+    date: "2026-04-22",
+    changes: [
+      "imap-sync の同期ループハングを修正: fromUid:* では imapflow の iterator が閉じないサーバがあるため、fromUid:actualMaxUid で上限を明示",
+      "1 tick あたりの処理上限を 5→30 に引き上げ (hang 対策が入ったため速度を戻した)",
+      "処理完了ログ (FETCH LOOP DONE / DONE / LOGOUT) を追加してハング箇所を追跡可能に",
+    ],
+  },
+  {
     version: "0.3.1",
     date: "2026-04-22",
     changes: [
