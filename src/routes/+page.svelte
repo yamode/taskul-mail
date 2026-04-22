@@ -27,6 +27,16 @@
     direction: string;
   };
   type Account = { id: string; label: string; is_shared: boolean; sort_order?: number; default_tone?: string; unread_count?: number };
+  type Comment = {
+    id: string;
+    message_id: string;
+    author_id: string;
+    author_email: string | null;
+    author_name: string | null;
+    body: string;
+    created_at: string;
+    updated_at: string;
+  };
 
   // 返信/転送時のインラインコンポーズ状態。
   // gmail のように本文エリアを返信レイアウトに入れ替える。
@@ -53,7 +63,18 @@
   let sending = $state(false);
   let hint = $state("");
   let userId = $state<string | null>(null);
+  let userEmail = $state<string | null>(null);
+  let userDisplayName = $state<string | null>(null);
   let hoverThreadId = $state<string | null>(null);
+
+  // コメント (社内メモ)
+  //   - メッセージ単位で持つ: commentsByMessage[message_id] = Comment[]
+  //   - スレッド一覧にバッジを出すため、スレッド単位の件数も別途保持
+  //   - commentDraft: 各メッセージの入力フォームの内容
+  let commentsByMessage = $state<Record<string, Comment[]>>({});
+  let commentCountByThread = $state<Record<string, number>>({});
+  let commentDraft = $state<Record<string, string>>({});
+  let commentSaving = $state<Record<string, boolean>>({});
 
   let filtered = $derived(
     filterAccountId
@@ -168,6 +189,12 @@
     } catch { /* ignore */ }
     const { data: { user } } = await supabase.auth.getUser();
     userId = user?.id ?? null;
+    userEmail = user?.email ?? null;
+    const meta = (user?.user_metadata ?? {}) as Record<string, unknown>;
+    userDisplayName =
+      (meta.full_name as string | undefined) ??
+      (meta.name as string | undefined) ??
+      null;
     await Promise.all([loadAccounts(), loadThreads()]);
 
     // IMAP 同期は 60 秒に 1 回 (重いので頻度据え置き)
@@ -192,6 +219,17 @@
             if (selectedThreadId && payload?.new?.thread_id === selectedThreadId) {
               void loadMessages(selectedThreadId);
             }
+          },
+        )
+        .on(
+          // @ts-ignore — コメントの変更を全員にブロードキャスト
+          "postgres_changes",
+          { event: "*", schema: "mail", table: "message_comments" },
+          () => {
+            // 開いているスレッドのコメントを再読込
+            if (selectedThreadId) void loadCommentsForOpenThread();
+            // スレッド一覧のバッジ数も更新
+            void refreshCommentCounts();
           },
         )
         .subscribe();
@@ -494,6 +532,31 @@
       unread_count: perAccount.get(a.id) ?? 0,
     }));
 
+    // スレッド別コメント件数 (バッジ表示用)
+    if (base.length > 0) {
+      const threadIds = base.map((t) => t.id);
+      const { data: threadMsgs } = await mail
+        .from("messages")
+        .select("id,thread_id")
+        .in("thread_id", threadIds);
+      const msgToThread = new Map<string, string>();
+      for (const m of (threadMsgs ?? []) as any[]) msgToThread.set(m.id, m.thread_id);
+      if (msgToThread.size > 0) {
+        const { data: cmts } = await mail
+          .from("message_comments")
+          .select("message_id")
+          .in("message_id", Array.from(msgToThread.keys()));
+        const counts: Record<string, number> = {};
+        for (const c of (cmts ?? []) as any[]) {
+          const tid = msgToThread.get(c.message_id);
+          if (tid) counts[tid] = (counts[tid] ?? 0) + 1;
+        }
+        commentCountByThread = counts;
+      } else {
+        commentCountByThread = {};
+      }
+    }
+
     const justArrived = new Set<string>();
     if (knownThreadIds.size > 0) {
       for (const t of base) {
@@ -517,6 +580,7 @@
       .eq("thread_id", threadId)
       .order("received_at", { ascending: true });
     messages = (data ?? []) as Message[];
+    await loadCommentsForOpenThread();
   }
 
   async function openThread(t: Thread) {
@@ -978,6 +1042,130 @@
     }
   }
 
+  // ------------------------------------------------------------
+  // 社内コメント (message_comments)
+  //   共有アドレスで「このメールは誰が対応予定か」「何のために残しているか」を
+  //   メンバー間で共有するための内部メモ。メール本体には反映されない。
+  // ------------------------------------------------------------
+
+  async function loadCommentsForOpenThread() {
+    if (messages.length === 0) {
+      commentsByMessage = {};
+      return;
+    }
+    const ids = messages.map((m) => m.id);
+    const { data, error } = await mail
+      .from("message_comments")
+      .select("id,message_id,author_id,author_email,author_name,body,created_at,updated_at")
+      .in("message_id", ids)
+      .order("created_at", { ascending: true });
+    if (error) {
+      console.warn("loadComments failed", error);
+      return;
+    }
+    const next: Record<string, Comment[]> = {};
+    for (const c of (data ?? []) as Comment[]) {
+      (next[c.message_id] ??= []).push(c);
+    }
+    commentsByMessage = next;
+  }
+
+  async function refreshCommentCounts() {
+    if (threads.length === 0) return;
+    const threadIds = threads.map((t) => t.id);
+    const { data: threadMsgs } = await mail
+      .from("messages")
+      .select("id,thread_id")
+      .in("thread_id", threadIds);
+    const msgToThread = new Map<string, string>();
+    for (const m of (threadMsgs ?? []) as any[]) msgToThread.set(m.id, m.thread_id);
+    if (msgToThread.size === 0) {
+      commentCountByThread = {};
+      return;
+    }
+    const { data: cmts } = await mail
+      .from("message_comments")
+      .select("message_id")
+      .in("message_id", Array.from(msgToThread.keys()));
+    const counts: Record<string, number> = {};
+    for (const c of (cmts ?? []) as any[]) {
+      const tid = msgToThread.get(c.message_id);
+      if (tid) counts[tid] = (counts[tid] ?? 0) + 1;
+    }
+    commentCountByThread = counts;
+  }
+
+  async function addComment(messageId: string) {
+    if (!userId) return;
+    const body = (commentDraft[messageId] ?? "").trim();
+    if (!body) return;
+    commentSaving = { ...commentSaving, [messageId]: true };
+    const { data, error } = await mail
+      .from("message_comments")
+      .insert({
+        message_id: messageId,
+        author_id: userId,
+        author_email: userEmail,
+        author_name: userDisplayName,
+        body,
+      })
+      .select("id,message_id,author_id,author_email,author_name,body,created_at,updated_at")
+      .single();
+    commentSaving = { ...commentSaving, [messageId]: false };
+    if (error) {
+      alert(`コメント投稿に失敗: ${error.message}`);
+      return;
+    }
+    const inserted = data as Comment;
+    commentsByMessage = {
+      ...commentsByMessage,
+      [messageId]: [...(commentsByMessage[messageId] ?? []), inserted],
+    };
+    commentDraft = { ...commentDraft, [messageId]: "" };
+    if (selectedThreadId) {
+      commentCountByThread = {
+        ...commentCountByThread,
+        [selectedThreadId]: (commentCountByThread[selectedThreadId] ?? 0) + 1,
+      };
+    }
+  }
+
+  async function deleteComment(c: Comment) {
+    if (c.author_id !== userId) return;
+    if (!confirm("このコメントを削除しますか?")) return;
+    const { error } = await mail
+      .from("message_comments")
+      .delete()
+      .eq("id", c.id);
+    if (error) {
+      alert(`削除に失敗: ${error.message}`);
+      return;
+    }
+    const list = (commentsByMessage[c.message_id] ?? []).filter((x) => x.id !== c.id);
+    commentsByMessage = { ...commentsByMessage, [c.message_id]: list };
+    if (selectedThreadId && (commentCountByThread[selectedThreadId] ?? 0) > 0) {
+      commentCountByThread = {
+        ...commentCountByThread,
+        [selectedThreadId]: commentCountByThread[selectedThreadId] - 1,
+      };
+    }
+  }
+
+  function commentAuthorLabel(c: Comment): string {
+    if (c.author_id === userId) return "自分";
+    return c.author_name || c.author_email || "メンバー";
+  }
+
+  function formatCommentTime(iso: string): string {
+    const d = new Date(iso);
+    void nowTick;
+    const diff = Math.max(0, Date.now() - d.getTime());
+    if (diff < 60_000) return "たった今";
+    if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分前`;
+    if (diff < 86_400_000) return `${Math.floor(diff / 3600_000)} 時間前`;
+    return d.toLocaleString("ja-JP");
+  }
+
   // 相対時刻表示 ("1 分前", "たった今")。nowTick を参照して 30s 毎に更新。
   function formatRelative(ts: number | null): string {
     if (!ts) return "未同期";
@@ -1133,6 +1321,11 @@
             <div class="subject">
               {#if (t.unread_count ?? 0) > 0}
                 <span class="badge">{t.unread_count}</span>
+              {/if}
+              {#if (commentCountByThread[t.id] ?? 0) > 0}
+                <span class="comment-badge" title="社内メモ {commentCountByThread[t.id]} 件">
+                  💬 {commentCountByThread[t.id]}
+                </span>
               {/if}
               {t.subject_normalized || "(件名なし)"}
             </div>
@@ -1296,6 +1489,68 @@
           </header>
           <h3>{m.subject ?? ""}</h3>
           <pre>{m.body_text ?? ""}</pre>
+
+          <!-- 社内コメント (メール本体には送信されない) -->
+          <!-- 親 .message (role=button) の click/keydown が markRead を発火するのを止めるためのラッパ -->
+          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+          <div
+            class="comments"
+            role="region"
+            aria-label="社内メモ"
+            onclick={(e) => e.stopPropagation()}
+            onkeydown={(e) => e.stopPropagation()}
+          >
+            <div class="comments-head">
+              <span class="comments-title">💬 社内メモ</span>
+              {#if (commentsByMessage[m.id] ?? []).length > 0}
+                <span class="comments-count">{(commentsByMessage[m.id] ?? []).length} 件</span>
+              {/if}
+              <span class="comments-hint">このメモはメール送信されません</span>
+            </div>
+            {#if (commentsByMessage[m.id] ?? []).length === 0}
+              <p class="comments-empty">まだコメントはありません</p>
+            {:else}
+              <ul class="comment-list">
+                {#each commentsByMessage[m.id] ?? [] as c (c.id)}
+                  <li class="comment" class:own={c.author_id === userId}>
+                    <div class="comment-meta">
+                      <strong>{commentAuthorLabel(c)}</strong>
+                      <span class="comment-time">{formatCommentTime(c.created_at)}</span>
+                      {#if c.author_id === userId}
+                        <button
+                          class="comment-del"
+                          title="削除"
+                          onclick={(e) => { e.stopPropagation(); void deleteComment(c); }}
+                        >✕</button>
+                      {/if}
+                    </div>
+                    <pre class="comment-body">{c.body}</pre>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+            <div class="comment-input" role="presentation" onclick={(e) => e.stopPropagation()}>
+              <textarea
+                rows="2"
+                placeholder="例: 明日ひかるさんが返信予定 / 要確認: 請求内容"
+                value={commentDraft[m.id] ?? ""}
+                oninput={(e) => (commentDraft = { ...commentDraft, [m.id]: (e.currentTarget as HTMLTextAreaElement).value })}
+                onkeydown={(e) => {
+                  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                    e.preventDefault();
+                    void addComment(m.id);
+                  }
+                }}
+              ></textarea>
+              <button
+                class="primary"
+                disabled={commentSaving[m.id] || !((commentDraft[m.id] ?? "").trim())}
+                onclick={(e) => { e.stopPropagation(); void addComment(m.id); }}
+              >
+                {commentSaving[m.id] ? "投稿中…" : "投稿 (⌘/Ctrl+Enter)"}
+              </button>
+            </div>
+          </div>
         </div>
       {/each}
     {/if}
@@ -2162,4 +2417,128 @@
     padding: 0.15rem 0.3rem;
   }
   .undo-toast .toast-close:hover { color: #d1d5db; }
+
+  /* ===== 社内メモ (message_comments) ===== */
+  .comment-badge {
+    display: inline-block;
+    margin-right: 0.4rem;
+    padding: 0.05rem 0.4rem;
+    background: #fef3c7;
+    color: #92400e;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    vertical-align: middle;
+  }
+  .comments {
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed #d1d5db;
+    background: #fffbeb;
+    border-radius: 6px;
+    padding: 0.75rem;
+  }
+  .comments-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.82rem;
+  }
+  .comments-title {
+    font-weight: 700;
+    color: #92400e;
+  }
+  .comments-count {
+    color: #78350f;
+  }
+  .comments-hint {
+    margin-left: auto;
+    color: #9ca3af;
+    font-size: 0.72rem;
+  }
+  .comments-empty {
+    margin: 0 0 0.5rem;
+    color: #9ca3af;
+    font-size: 0.82rem;
+  }
+  .comment-list {
+    list-style: none;
+    margin: 0 0 0.5rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .comment {
+    background: #ffffff;
+    border: 1px solid #fde68a;
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+  }
+  .comment.own {
+    border-color: #93c5fd;
+    background: #eff6ff;
+  }
+  .comment-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.75rem;
+    color: #4b5563;
+  }
+  .comment-meta strong {
+    color: #111827;
+    font-weight: 600;
+  }
+  .comment-time {
+    color: #9ca3af;
+  }
+  .comment-del {
+    margin-left: auto;
+    background: transparent;
+    border: none;
+    color: #9ca3af;
+    cursor: pointer;
+    padding: 0 0.25rem;
+  }
+  .comment-del:hover { color: #ef4444; }
+  .comment-body {
+    margin: 0.25rem 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    font-size: 0.88rem;
+    color: #111827;
+  }
+  .comment-input {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+  }
+  .comment-input textarea {
+    flex: 1;
+    resize: vertical;
+    min-height: 2.5rem;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 0.88rem;
+  }
+  .comment-input button {
+    align-self: flex-end;
+    padding: 0.35rem 0.7rem;
+    font-size: 0.82rem;
+    border-radius: 6px;
+    border: 1px solid #2563eb;
+    background: #2563eb;
+    color: #fff;
+    cursor: pointer;
+  }
+  .comment-input button:disabled {
+    background: #9ca3af;
+    border-color: #9ca3af;
+    cursor: not-allowed;
+  }
 </style>
