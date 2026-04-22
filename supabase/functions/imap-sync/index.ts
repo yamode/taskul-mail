@@ -12,7 +12,7 @@ import { simpleParser } from "npm:mailparser@3.6.9";
 import { Buffer } from "node:buffer";
 import { adminClient, readSecret } from "../_shared/vault.ts";
 import { handlePreflight, jsonResponse } from "../_shared/cors.ts";
-import { fetchSourceRawImap } from "../_shared/raw-imap.ts";
+import { fetchSourcesRawImap } from "../_shared/raw-imap.ts";
 
 const ATTACHMENTS_BUCKET = "mail-attachments";
 
@@ -229,33 +229,38 @@ async function syncOneAccount(
     diag.target_uid_count = targetUids.length;
 
     // 2 段フェッチ:
-    //   Phase 1: imapflow で envelope + size + internalDate を軽量取得 (15s)
-    //   Phase 2: 生 IMAP (Deno TLS + AUTHENTICATE PLAIN + UID FETCH BODY.PEEK[]) で本文取得 (60s)
+    //   Phase 1: imapflow で envelope + size + internalDate を UID ごとに軽量取得 (15s/件)
+    //   Phase 2: 生 IMAP (Deno TLS + AUTHENTICATE PLAIN + UID FETCH BODY.PEEK[]) を
+    //            1 セッション内で複数 UID まとめて連続取得。
     //            imapflow の fetchOne({source:true}) / download() は Courier 上で hang するので使わない。
+    //            UID 1 件ごとの TLS+AUTH+SELECT を繰り返す旧実装は Xserver Courier で頻繁に
+    //            タイムアウトしていたため、接続は 1 回に集約する。
     //   本文取得失敗時は envelope-only で挿入 (件名/送信者だけでも残す)。
-    // 連続 envelope 失敗は接続異常の可能性が高いので 3 件で run を打ち切る。
+    // 連続 envelope 失敗は接続異常の可能性が高いので 3 件で envelope phase を打ち切る。
     const ENVELOPE_TIMEOUT_MS = 15_000;
-    const SOURCE_TIMEOUT_MS = 60_000;
+    const SOURCE_PER_UID_TIMEOUT_MS = 45_000;
     const MAX_SOURCE_SIZE = 25 * 1024 * 1024; // 25MB
     const MAX_CONSECUTIVE_SKIPS = 3;
     const skippedUids: number[] = [];
     let rawFetchOk = 0;
     let rawFetchFail = 0;
-    const fetchIter = (async function* () {
+
+    // Phase 1: envelope をまとめて取得
+    type Meta = Record<string, unknown> & { uid?: number; size?: number };
+    const envelopes: Meta[] = [];
+    {
       let consecutiveSkips = 0;
       for (let i = 0; i < targetUids.length; i++) {
         const uid = targetUids[i];
-        console.log(`[${account.email_address}] fetch ${i + 1}/${targetUids.length} uid=${uid} begin`);
-
-        // Phase 1: envelope (fast)
-        let meta: Record<string, unknown> | null = null;
+        console.log(`[${account.email_address}] envelope ${i + 1}/${targetUids.length} uid=${uid} begin`);
+        let meta: Meta | null = null;
         try {
           meta = await withTimeout(
             client.fetchOne(
               String(uid),
               { uid: true, envelope: true, internalDate: true, size: true },
               { uid: true },
-            ) as Promise<Record<string, unknown> | null>,
+            ) as Promise<Meta | null>,
             ENVELOPE_TIMEOUT_MS,
             `envelope_timeout uid=${uid}`,
           );
@@ -264,45 +269,62 @@ async function syncOneAccount(
           skippedUids.push(uid);
           consecutiveSkips++;
           if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
-            console.warn(`[${account.email_address}] ${consecutiveSkips} consecutive skips — aborting this run`);
+            console.warn(`[${account.email_address}] ${consecutiveSkips} consecutive envelope skips — aborting envelope phase`);
             break;
           }
           continue;
         }
         if (!meta) {
-          console.warn(`[${account.email_address}] envelope fetch uid=${uid} returned null`);
           skippedUids.push(uid);
           consecutiveSkips++;
           if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) break;
           continue;
         }
+        consecutiveSkips = 0;
+        envelopes.push(meta);
+      }
+    }
 
+    // Phase 2: サイズ上限以下の UID を 1 セッションで連続取得
+    const bodyTargets = envelopes
+      .map((m) => ({ uid: Number(m.uid), size: Number(m.size ?? 0) }))
+      .filter((x) => x.uid > 0 && x.size > 0 && x.size <= MAX_SOURCE_SIZE)
+      .map((x) => x.uid);
+    const sourceMap = new Map<number, Uint8Array>();
+    if (bodyTargets.length > 0) {
+      console.log(`[${account.email_address}] raw-imap batch start uids=${bodyTargets.length}`);
+      const overallTimeout = SOURCE_PER_UID_TIMEOUT_MS * bodyTargets.length + 30_000;
+      const batch = await fetchSourcesRawImap({
+        host: account.imap_host,
+        port: account.imap_port,
+        user: account.username,
+        pass: password,
+        uids: bodyTargets,
+        perUidTimeoutMs: SOURCE_PER_UID_TIMEOUT_MS,
+        overallTimeoutMs: overallTimeout,
+      });
+      for (const [uid, src] of batch.sources) {
+        sourceMap.set(uid, src);
+        rawFetchOk++;
+      }
+      for (const [uid, err] of batch.errors) {
+        rawFetchFail++;
+        console.warn(`[${account.email_address}] raw-imap batch uid=${uid} FAILED: ${err}`);
+      }
+      console.log(`[${account.email_address}] raw-imap batch done ok=${batch.sources.size} fail=${batch.errors.size}`);
+    }
+
+    // Phase 3: envelope + source を束ねて逐次処理
+    const fetchIter = (async function* () {
+      for (const meta of envelopes) {
+        const uid = Number((meta as { uid?: unknown }).uid);
         const msgSize = Number((meta as { size?: unknown }).size ?? 0);
-        console.log(`[${account.email_address}] fetch ${i + 1}/${targetUids.length} uid=${uid} envelope ok size=${msgSize}`);
-
-        // Phase 2: 生 IMAP で本文取得
         if (msgSize > MAX_SOURCE_SIZE) {
           console.warn(`[${account.email_address}] uid=${uid} size=${msgSize} exceeds ${MAX_SOURCE_SIZE} — envelope-only`);
         } else {
-          try {
-            const source = await fetchSourceRawImap({
-              host: account.imap_host,
-              port: account.imap_port,
-              user: account.username,
-              pass: password,
-              uid,
-              timeoutMs: SOURCE_TIMEOUT_MS,
-            });
-            (meta as { source?: Uint8Array }).source = source;
-            rawFetchOk++;
-            console.log(`[${account.email_address}] raw-imap uid=${uid} ok bytes=${source.byteLength}`);
-          } catch (e) {
-            rawFetchFail++;
-            console.warn(`[${account.email_address}] raw-imap uid=${uid} FAILED: ${(e as Error).message} — envelope-only`);
-          }
+          const src = sourceMap.get(uid);
+          if (src) (meta as { source?: Uint8Array }).source = src;
         }
-
-        consecutiveSkips = 0;
         yield meta as never;
       }
     })();

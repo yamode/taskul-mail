@@ -137,6 +137,140 @@ export async function fetchSourceRawImap(opts: RawFetchOptions): Promise<Uint8Ar
   }
 }
 
+export type BatchFetchOptions = {
+  host: string;
+  port: number;
+  user: string;
+  pass: string;
+  uids: number[];
+  mailbox?: string;
+  /** 1 UID の FETCH 応答待ちタイムアウト。既定 45s。 */
+  perUidTimeoutMs?: number;
+  /** セッション全体のタイムアウト。既定 per-UID × UID 数 + 30s。 */
+  overallTimeoutMs?: number;
+};
+
+export type BatchFetchResult = {
+  sources: Map<number, Uint8Array>;
+  /** UID -> エラーメッセージ。取得に成功した UID は含まれない。 */
+  errors: Map<number, string>;
+};
+
+/**
+ * 1 本の TLS 接続で AUTH+SELECT を 1 回だけ行い、複数 UID の BODY.PEEK[] を
+ * 直列で連続フェッチする。1 通の失敗/タイムアウトで次の UID に進む。
+ *
+ * 接続そのものが切れた (AUTH/SELECT 失敗 or 読み込み失敗) 時点で残り UID は
+ * すべて errors に積んで返す。
+ */
+export async function fetchSourcesRawImap(opts: BatchFetchOptions): Promise<BatchFetchResult> {
+  const mailbox = opts.mailbox ?? "INBOX";
+  const perUidTimeout = opts.perUidTimeoutMs ?? 45_000;
+  const overallTimeout = opts.overallTimeoutMs ?? (perUidTimeout * Math.max(1, opts.uids.length) + 30_000);
+
+  const sources = new Map<number, Uint8Array>();
+  const errors = new Map<number, string>();
+
+  if (opts.uids.length === 0) return { sources, errors };
+
+  const conn = await Deno.connectTls({ hostname: opts.host, port: opts.port });
+  const reader = new IMAPReader(conn);
+  const enc = new TextEncoder();
+  const write = async (s: string) => { await conn.write(enc.encode(s)); };
+
+  let seq = 0;
+  const nextTag = () => `a${++seq}`;
+
+  const readUntilTagged = async (tag: string): Promise<{ literal: Uint8Array | null; final: string }> => {
+    let lastLiteral: Uint8Array | null = null;
+    while (true) {
+      const line = await reader.readLine();
+      if (line.startsWith(tag + " ")) return { literal: lastLiteral, final: line };
+      const m = line.match(/\{(\d+)\}\r?\n$/);
+      if (m) {
+        const size = parseInt(m[1], 10);
+        lastLiteral = await reader.readBytes(size);
+        await reader.readLine();
+      }
+    }
+  };
+
+  const session = async (): Promise<void> => {
+    // greeting
+    await reader.readLine();
+
+    // AUTH
+    const payload = btoa(`\u0000${opts.user}\u0000${opts.pass}`);
+    const authTag = nextTag();
+    await write(`${authTag} AUTHENTICATE PLAIN ${payload}\r\n`);
+    const auth = await readUntilTagged(authTag);
+    if (!/^\S+\s+OK/i.test(auth.final)) {
+      throw new Error(`raw-imap batch auth failed: ${auth.final.trim()}`);
+    }
+
+    // SELECT
+    const selTag = nextTag();
+    await write(`${selTag} SELECT ${mailbox}\r\n`);
+    const sel = await readUntilTagged(selTag);
+    if (!/^\S+\s+OK/i.test(sel.final)) {
+      throw new Error(`raw-imap batch select failed: ${sel.final.trim()}`);
+    }
+
+    // 各 UID を直列でフェッチ
+    for (const uid of opts.uids) {
+      const fTag = nextTag();
+      try {
+        await write(`${fTag} UID FETCH ${uid} BODY.PEEK[]\r\n`);
+        const fetched = await withTimeout(
+          readUntilTagged(fTag),
+          perUidTimeout,
+          `raw-imap batch per-uid timeout uid=${uid}`,
+        );
+        if (!/^\S+\s+OK/i.test(fetched.final)) {
+          errors.set(uid, `fetch not ok: ${fetched.final.trim()}`);
+          continue;
+        }
+        if (!fetched.literal) {
+          errors.set(uid, `no BODY[] literal returned`);
+          continue;
+        }
+        sources.set(uid, fetched.literal);
+      } catch (e) {
+        const msg = (e as Error).message;
+        errors.set(uid, msg);
+        // per-uid タイムアウトでストリームが壊れている可能性が高い。
+        // これ以上同じ接続で続けると readLine が永久に詰まるのでセッション中断。
+        if (/per-uid timeout/.test(msg)) {
+          // 残りの UID をまとめてエラーに登録
+          const idx = opts.uids.indexOf(uid);
+          for (let j = idx + 1; j < opts.uids.length; j++) {
+            errors.set(opts.uids[j], `aborted after earlier timeout uid=${uid}`);
+          }
+          return;
+        }
+      }
+    }
+
+    // LOGOUT (best-effort)
+    try { await write(`${nextTag()} LOGOUT\r\n`); } catch { /* ignore */ }
+  };
+
+  try {
+    await withTimeout(session(), overallTimeout, `raw-imap batch overall timeout`);
+  } catch (e) {
+    const msg = (e as Error).message;
+    for (const uid of opts.uids) {
+      if (!sources.has(uid) && !errors.has(uid)) {
+        errors.set(uid, msg);
+      }
+    }
+  } finally {
+    try { conn.close(); } catch { /* ignore */ }
+  }
+
+  return { sources, errors };
+}
+
 export type TrashOptions = {
   host: string;
   port: number;
