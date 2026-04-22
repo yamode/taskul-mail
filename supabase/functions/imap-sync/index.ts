@@ -265,8 +265,19 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
             ),
           ]);
           console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} end gotSrc=${!!(one as { source?: unknown })?.source}`);
+          // fetchOne が null/undefined を返す場合は接続が壊れている (タイムアウト後の後続リクエスト等)
+          if (!one) {
+            console.warn(`[${account.email_address}] fetchOne uid=${uid} returned null — treating as skip`);
+            skippedUids.push(uid);
+            consecutiveSkips++;
+            if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
+              console.warn(`[${account.email_address}] ${consecutiveSkips} consecutive skips — aborting this run`);
+              break;
+            }
+            continue;
+          }
           consecutiveSkips = 0;
-          if (one) yield one as never;
+          yield one as never;
         } catch (e) {
           console.warn(`[${account.email_address}] fetchOne uid=${uid} PERMANENT_SKIP: ${(e as Error).message}`);
           skippedUids.push(uid);
@@ -409,11 +420,10 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     }
     console.log(`[${account.email_address}] FETCH LOOP DONE processed=${processed} skipped=${skippedUids.length}`);
 
-    // forward モードではスキップした UID も maxSeenUid に反映。
+    // スキップした UID も maxSeenUid に反映 (forward / first モード)。
     // こうしないと next run で同じ UID を再試行して永久ループするため。
-    // (backfill モードでは、スキップした UID は oldestSyncedUid より古いため
-    //  last_uid には影響しない)
-    if (mode === "forward" && skippedUids.length > 0) {
+    // backfill モードは oldestSyncedUid より古い UID なので last_uid には影響させない。
+    if (mode !== "backfill" && skippedUids.length > 0) {
       const maxSkipped = Math.max(...skippedUids);
       if (maxSkipped > maxSeenUid) {
         console.warn(`[${account.email_address}] advancing maxSeenUid past skipped UIDs: ${maxSeenUid} -> ${maxSkipped}`);
