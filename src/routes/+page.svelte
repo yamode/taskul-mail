@@ -1924,10 +1924,11 @@
 
   .threads {
     overflow-y: auto;
+    overflow-x: hidden;
     border-right: 1px solid #e5e7eb;
     background: #fff;
     /* Safari の戻る/進むジェスチャ抑止 (2 本指スワイプを削除専用に使う) */
-    overscroll-behavior-x: contain;
+    overscroll-behavior-x: none;
   }
   .inbox-header {
     position: sticky;

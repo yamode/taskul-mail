@@ -60,6 +60,9 @@
 </main>
 
 <style>
+  :global(html) {
+    overscroll-behavior-x: none;
+  }
   :global(body) {
     margin: 0;
     font-family:
@@ -67,6 +70,7 @@
       "Noto Sans JP", sans-serif;
     background: #f6f7f9;
     color: #222;
+    overscroll-behavior-x: none;
   }
   main { min-height: 100vh; }
   header {
