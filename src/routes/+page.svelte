@@ -163,6 +163,9 @@
   }
 
   onMount(async () => {
+    try {
+      accountsCollapsed = localStorage.getItem("taskul-mail.accounts-collapsed") === "1";
+    } catch { /* ignore */ }
     const { data: { user } } = await supabase.auth.getUser();
     userId = user?.id ?? null;
     await Promise.all([loadAccounts(), loadThreads()]);
@@ -228,6 +231,15 @@
       return;
     }
     accounts = (data ?? []) as Account[];
+  }
+
+  // アカウントサイドバー折りたたみ状態 (localStorage 永続化)
+  let accountsCollapsed = $state(false);
+  function toggleAccountsCollapsed() {
+    accountsCollapsed = !accountsCollapsed;
+    try {
+      localStorage.setItem("taskul-mail.accounts-collapsed", accountsCollapsed ? "1" : "0");
+    } catch { /* ignore */ }
   }
 
   let dragId = $state<string | null>(null);
@@ -509,10 +521,19 @@
   async function trashThread(t: Thread, e: Event) {
     e.stopPropagation();
     if (!confirm(`「${t.subject_normalized || "(件名なし)"}」をゴミ箱へ移動しますか？`)) return;
-    // 楽観的に UI から消す
+    await softDeleteThread(t.id);
+  }
+
+  // スワイプ削除 + hover 削除の共通実装。
+  // 楽観的に UI から消して trashed_at を更新。直近の削除は undo トーストで復元可能にする。
+  let recentlyDeletedIds = $state<string[]>([]);
+  let undoToastTimer: ReturnType<typeof setTimeout> | null = null;
+  const UNDO_WINDOW_MS = 5000;
+
+  async function softDeleteThread(id: string) {
     const prev = threads;
-    threads = threads.filter((x) => x.id !== t.id);
-    if (selectedThreadId === t.id) {
+    threads = threads.filter((x) => x.id !== id);
+    if (selectedThreadId === id) {
       selectedThreadId = null;
       messages = [];
       compose = null;
@@ -520,11 +541,107 @@
     const { error } = await mail
       .from("threads")
       .update({ trashed_at: new Date().toISOString() })
-      .eq("id", t.id);
+      .eq("id", id);
     if (error) {
       alert(`削除失敗: ${error.message}\n(migration 20260422000007 を SQL Editor で適用してください)`);
       threads = prev;
+      return;
     }
+    recentlyDeletedIds = [...recentlyDeletedIds, id];
+    if (undoToastTimer) clearTimeout(undoToastTimer);
+    undoToastTimer = setTimeout(() => {
+      recentlyDeletedIds = [];
+      undoToastTimer = null;
+    }, UNDO_WINDOW_MS);
+  }
+
+  async function undoRecentDeletes() {
+    if (recentlyDeletedIds.length === 0) return;
+    const ids = recentlyDeletedIds;
+    recentlyDeletedIds = [];
+    if (undoToastTimer) { clearTimeout(undoToastTimer); undoToastTimer = null; }
+    const { error } = await mail
+      .from("threads")
+      .update({ trashed_at: null })
+      .in("id", ids);
+    if (error) {
+      alert(`復元失敗: ${error.message}`);
+      return;
+    }
+    await loadThreads();
+  }
+
+  // Svelte action: タッチ左スワイプで削除を発火する。
+  // - 垂直スクロール優先判定付き (最初の 8px で horizontal/vertical を確定)
+  // - 閾値 (-100px) を超えたら card を -110% にスライドさせて onSwipe を呼ぶ
+  // - それ以外は元位置に戻す
+  function swipeable(
+    node: HTMLElement,
+    params: { threshold: number; onSwipe: () => void },
+  ) {
+    let startX = 0, startY = 0;
+    let active = false, decided = false, horizontal = false;
+    const threshold = params.threshold;
+
+    const bgEl = (): HTMLElement | null =>
+      node.parentElement?.querySelector(".swipe-bg") ?? null;
+
+    const onStart = (e: TouchEvent) => {
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      startX = t.clientX; startY = t.clientY;
+      active = true; decided = false; horizontal = false;
+      node.style.transition = "none";
+    };
+    const onMove = (e: TouchEvent) => {
+      if (!active) return;
+      const t = e.touches[0];
+      const dx = t.clientX - startX;
+      const dy = t.clientY - startY;
+      if (!decided) {
+        if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+        horizontal = Math.abs(dx) > Math.abs(dy);
+        decided = true;
+        if (!horizontal) { active = false; return; }
+      }
+      e.preventDefault();
+      const off = Math.min(0, dx);
+      node.style.transform = `translateX(${off}px)`;
+      const bg = bgEl();
+      if (bg) {
+        const ratio = Math.min(1, Math.abs(off) / Math.abs(threshold));
+        bg.style.opacity = String(0.25 + ratio * 0.75);
+      }
+    };
+    const onEnd = () => {
+      if (!active) return;
+      active = false;
+      const m = node.style.transform.match(/-?\d+(\.\d+)?/);
+      const off = m ? parseFloat(m[0]) : 0;
+      node.style.transition = "transform 200ms ease-out";
+      const bg = bgEl();
+      if (off <= threshold) {
+        node.style.transform = "translateX(-110%)";
+        setTimeout(() => params.onSwipe(), 180);
+      } else {
+        node.style.transform = "";
+        if (bg) bg.style.opacity = "";
+      }
+    };
+
+    node.addEventListener("touchstart", onStart, { passive: true });
+    node.addEventListener("touchmove", onMove, { passive: false });
+    node.addEventListener("touchend", onEnd);
+    node.addEventListener("touchcancel", onEnd);
+
+    return {
+      destroy() {
+        node.removeEventListener("touchstart", onStart);
+        node.removeEventListener("touchmove", onMove);
+        node.removeEventListener("touchend", onEnd);
+        node.removeEventListener("touchcancel", onEnd);
+      },
+    };
   }
 
   async function cancelCompose() {
@@ -651,13 +768,23 @@
   }
 </script>
 
-<div class="layout">
-  <aside class="accounts">
+<div class="layout" class:accounts-collapsed={accountsCollapsed}>
+  <aside class="accounts" class:collapsed={accountsCollapsed}>
+    <button
+      class="toggle-collapse"
+      onclick={toggleAccountsCollapsed}
+      title={accountsCollapsed ? "サイドバーを展開" : "サイドバーを折りたたむ"}
+      aria-label={accountsCollapsed ? "サイドバーを展開" : "サイドバーを折りたたむ"}
+    >
+      {accountsCollapsed ? "»" : "«"}
+    </button>
     <button
       class="account"
       class:selected={filterAccountId === "all"}
       onclick={() => (filterAccountId = "all")}
+      title="すべてのアカウント"
     >
+      <span class="account-initial">全</span>
       <span class="account-label">すべて</span>
     </button>
     {#each accounts as a (a.id)}
@@ -671,8 +798,10 @@
         ondragover={(e) => e.preventDefault()}
         ondrop={() => onDropAccount(a.id)}
         onclick={() => (filterAccountId = a.id)}
+        title={a.label}
       >
         <span class="grip" title="ドラッグで並び替え">⋮⋮</span>
+        <span class="account-initial">{a.label.slice(0, 1) || "?"}</span>
         {#if a.is_shared}
           <span class="shared-badge" title="共有アカウント">共</span>
         {/if}
@@ -691,6 +820,7 @@
         {/if}
         {#if (a.unread_count ?? 0) > 0}
           <span class="account-unread">{a.unread_count}</span>
+          <span class="account-unread-dot" aria-hidden="true"></span>
         {/if}
       </button>
     {/each}
@@ -699,17 +829,26 @@
         class="reload"
         onclick={() => { void syncTick(); }}
         disabled={anySyncing}
-        title={aggregateError ? `エラーあり: ${aggregateError}` : "全アカウントを同期"}
+        title={
+          aggregateError
+            ? `エラーあり: ${aggregateError}`
+            : anySyncing
+              ? `同期中 ${syncProgress.done}/${syncProgress.total}`
+              : "全アカウントを同期"
+        }
       >
         {#if anySyncing}
           <span class="spinner" aria-hidden="true"></span>
-          同期中… ({syncProgress.done}/{syncProgress.total})
+          <span class="reload-label">同期中… ({syncProgress.done}/{syncProgress.total})</span>
         {:else if aggregateError && syncProgress.errored === syncProgress.total}
-          ⚠ 全アカウント同期エラー
+          <span class="reload-icon">⚠</span>
+          <span class="reload-label">全アカウント同期エラー</span>
         {:else if aggregateError}
-          ⚠ 一部エラー ({syncProgress.errored}件) — 再試行
+          <span class="reload-icon">⚠</span>
+          <span class="reload-label">一部エラー ({syncProgress.errored}件) — 再試行</span>
         {:else}
-          ↻ 全アカウント再同期
+          <span class="reload-icon">↻</span>
+          <span class="reload-label">全アカウント再同期</span>
         {/if}
       </button>
       <div class="sync-info" class:error={!!aggregateError}>
@@ -720,44 +859,50 @@
 
   <aside class="threads">
     {#each filtered as t (t.id)}
-      <div
-        class="thread-row"
-        class:selected={selectedThreadId === t.id}
-        class:unread={(t.unread_count ?? 0) > 0}
-        class:arrived={newThreadIds.has(t.id)}
-        onmouseenter={() => (hoverThreadId = t.id)}
-        onmouseleave={() => (hoverThreadId = null)}
-        role="presentation"
-      >
-        <button class="thread" onclick={() => openThread(t)}>
-          <div class="meta">
-            <span class="label">{t.account_label ?? ""}</span>
-            <span class="date">
-              {new Date(t.last_message_at).toLocaleDateString("ja-JP")}
-            </span>
-          </div>
-          <div class="subject">
-            {#if (t.unread_count ?? 0) > 0}
-              <span class="badge">{t.unread_count}</span>
-            {/if}
-            {t.subject_normalized || "(件名なし)"}
-          </div>
-          <div class="participants">{t.participants.slice(0, 2).join(", ")}</div>
-        </button>
-        {#if hoverThreadId === t.id}
-          <div class="thread-actions">
-            <button
-              class="act-btn"
-              title="転送"
-              onclick={(e) => forwardThread(t, e)}
-            >→</button>
-            <button
-              class="act-btn danger"
-              title="削除"
-              onclick={(e) => trashThread(t, e)}
-            >🗑</button>
-          </div>
-        {/if}
+      <div class="thread-swipe">
+        <div class="swipe-bg" aria-hidden="true">
+          <span class="swipe-icon">🗑 削除</span>
+        </div>
+        <div
+          class="thread-row"
+          class:selected={selectedThreadId === t.id}
+          class:unread={(t.unread_count ?? 0) > 0}
+          class:arrived={newThreadIds.has(t.id)}
+          onmouseenter={() => (hoverThreadId = t.id)}
+          onmouseleave={() => (hoverThreadId = null)}
+          role="presentation"
+          use:swipeable={{ threshold: -100, onSwipe: () => softDeleteThread(t.id) }}
+        >
+          <button class="thread" onclick={() => openThread(t)}>
+            <div class="meta">
+              <span class="label">{t.account_label ?? ""}</span>
+              <span class="date">
+                {new Date(t.last_message_at).toLocaleDateString("ja-JP")}
+              </span>
+            </div>
+            <div class="subject">
+              {#if (t.unread_count ?? 0) > 0}
+                <span class="badge">{t.unread_count}</span>
+              {/if}
+              {t.subject_normalized || "(件名なし)"}
+            </div>
+            <div class="participants">{t.participants.slice(0, 2).join(", ")}</div>
+          </button>
+          {#if hoverThreadId === t.id}
+            <div class="thread-actions">
+              <button
+                class="act-btn"
+                title="転送"
+                onclick={(e) => forwardThread(t, e)}
+              >→</button>
+              <button
+                class="act-btn danger"
+                title="削除"
+                onclick={(e) => trashThread(t, e)}
+              >🗑</button>
+            </div>
+          {/if}
+        </div>
       </div>
     {/each}
     {#if filtered.length === 0}
@@ -907,21 +1052,93 @@
   </section>
 </div>
 
+{#if recentlyDeletedIds.length > 0}
+  <div class="undo-toast" role="status">
+    <span>🗑 {recentlyDeletedIds.length} 件削除しました</span>
+    <button onclick={undoRecentDeletes}>元に戻す</button>
+    <button
+      class="toast-close"
+      onclick={() => { recentlyDeletedIds = []; if (undoToastTimer) { clearTimeout(undoToastTimer); undoToastTimer = null; } }}
+      aria-label="閉じる"
+    >✕</button>
+  </div>
+{/if}
+
 <style>
   .layout {
     display: grid;
     grid-template-columns: 200px 340px 1fr;
     height: calc(100vh - 56px);
+    transition: grid-template-columns 180ms ease-out;
+  }
+  .layout.accounts-collapsed {
+    grid-template-columns: 52px 340px 1fr;
   }
   .accounts {
     overflow-y: auto;
+    overflow-x: hidden;
     background: #f3f4f6;
     border-right: 1px solid #e5e7eb;
     padding: 0.5rem 0.4rem;
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
+    position: relative;
   }
+  .toggle-collapse {
+    align-self: flex-end;
+    background: transparent;
+    border: 1px solid #e5e7eb;
+    color: #6b7280;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    cursor: pointer;
+    margin-bottom: 0.25rem;
+  }
+  .toggle-collapse:hover { background: #fff; color: #374151; }
+  .accounts.collapsed .toggle-collapse { align-self: center; }
+  /* 通常モードでは initial を隠す */
+  .account-initial { display: none; }
+  /* 折りたたみモードの表示調整 */
+  .accounts.collapsed .account {
+    justify-content: center;
+    padding: 0.45rem 0.25rem;
+    position: relative;
+  }
+  .accounts.collapsed .account .grip,
+  .accounts.collapsed .account .account-label,
+  .accounts.collapsed .account .shared-badge,
+  .accounts.collapsed .account .account-unread { display: none; }
+  .accounts.collapsed .account .account-initial {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    background: #e5e7eb;
+    color: #374151;
+    border-radius: 50%;
+    font-weight: 700;
+    font-size: 0.85rem;
+  }
+  .accounts.collapsed .account.selected .account-initial {
+    background: #2563eb;
+    color: #fff;
+  }
+  .accounts.collapsed .account .account-unread-dot {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 9px;
+    height: 9px;
+    background: #ef4444;
+    border: 2px solid #f3f4f6;
+    border-radius: 50%;
+  }
+  /* 展開モードでは unread-dot は使わない */
+  .account-unread-dot { display: none; }
   .account {
     display: flex;
     align-items: center;
@@ -988,6 +1205,9 @@
     margin-top: 0.25rem;
   }
   .sync-info.error { color: #b45309; }
+  .accounts.collapsed .accounts-footer .reload { padding: 0.4rem 0.2rem; }
+  .accounts.collapsed .accounts-footer .reload-label { display: none; }
+  .accounts.collapsed .sync-info { display: none; }
   .spinner {
     width: 10px;
     height: 10px;
@@ -1003,9 +1223,32 @@
     border-right: 1px solid #e5e7eb;
     background: #fff;
   }
+  .thread-swipe {
+    position: relative;
+    overflow: hidden;
+    border-bottom: 1px solid #f0f0f0;
+  }
+  .swipe-bg {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, #fca5a5 0%, #dc2626 50%);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding-right: 1.25rem;
+    font-weight: 600;
+    font-size: 0.9rem;
+    opacity: 0;
+    pointer-events: none;
+    user-select: none;
+  }
+  .swipe-icon { letter-spacing: 0.02em; }
   .thread-row {
     position: relative;
-    border-bottom: 1px solid #f0f0f0;
+    background: #fff;
+    touch-action: pan-y;
+    will-change: transform;
   }
   .thread {
     display: block;
@@ -1017,7 +1260,7 @@
     border: none;
     cursor: pointer;
   }
-  .thread-row:hover { background: #f9fafb; }
+  .thread-swipe:hover .thread-row { background: #f9fafb; }
   .thread-row.selected { background: #eff6ff; }
   .thread-row.unread .subject { font-weight: 700; }
   .thread-row.arrived {
@@ -1310,4 +1553,42 @@
     border-radius: 0 4px 4px 0;
   }
 
+  /* ===== Undo toast (swipe 削除用) ===== */
+  .undo-toast {
+    position: fixed;
+    bottom: 1.5rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1f2937;
+    color: #fff;
+    padding: 0.55rem 0.75rem 0.55rem 1rem;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+    z-index: 1000;
+    font-size: 0.88rem;
+    animation: undoSlideIn 200ms ease-out;
+  }
+  @keyframes undoSlideIn {
+    from { opacity: 0; transform: translate(-50%, 12px); }
+    to { opacity: 1; transform: translate(-50%, 0); }
+  }
+  .undo-toast button {
+    background: transparent;
+    border: none;
+    color: #93c5fd;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.88rem;
+    padding: 0.15rem 0.4rem;
+  }
+  .undo-toast button:hover { color: #bfdbfe; }
+  .undo-toast .toast-close {
+    color: #9ca3af;
+    font-weight: 400;
+    padding: 0.15rem 0.3rem;
+  }
+  .undo-toast .toast-close:hover { color: #d1d5db; }
 </style>

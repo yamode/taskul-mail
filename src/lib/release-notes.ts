@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.7.0",
+    date: "2026-04-22",
+    changes: [
+      "スレッド一覧でタッチ左スワイプによる削除に対応 (iPhone/iPad 向け): 閾値 -100px でソフトデリート、連続で何件でもスワイプ可能",
+      "削除時に undo トーストを 5 秒間表示、「元に戻す」で直近の削除をまとめて復元",
+      "アカウントサイドバーを折りたたみ可能に: « / » ボタンでトグル (52px に収縮)、折りたたみ中はアカウント頭文字を円形アバターで表示、未読は赤ドット、状態は localStorage で永続化",
+    ],
+  },
+  {
     version: "0.6.1",
     date: "2026-04-22",
     changes: [
