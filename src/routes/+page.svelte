@@ -254,7 +254,6 @@
     if (!userId) return;
     const acc = accounts.find((a) => a.id === accountId);
     if (!acc) return;
-    if (!confirm(`「${acc.label}」の未読メールをすべて既読にしますか？`)) return;
     // 対象アカウントの全 inbound メッセージ ID を取得
     const { data: msgs } = await mail
       .from("messages")
@@ -276,6 +275,93 @@
     threads = threads.map((t) =>
       t.account_id === accountId ? { ...t, unread_count: 0 } : t,
     );
+  }
+
+  // 新規作成モーダル
+  type NewCompose = {
+    to: string;
+    cc: string;
+    bcc: string;
+    subject: string;
+    body: string;
+    draftId: string | null;
+  };
+  let newComposeOpen = $state(false);
+  let newComposeSending = $state(false);
+  let newCompose = $state<NewCompose>({
+    to: "", cc: "", bcc: "", subject: "", body: "", draftId: null,
+  });
+
+  function newComposeHasContent(): boolean {
+    return (
+      newCompose.to.trim() !== "" ||
+      newCompose.cc.trim() !== "" ||
+      newCompose.bcc.trim() !== "" ||
+      newCompose.subject.trim() !== "" ||
+      newCompose.body.trim() !== ""
+    );
+  }
+
+  function openNewCompose() {
+    newCompose = { to: "", cc: "", bcc: "", subject: "", body: "", draftId: null };
+    newComposeOpen = true;
+  }
+
+  async function saveNewComposeDraft(): Promise<string | null> {
+    if (!filterAccountId || !userId) return null;
+    if (!newComposeHasContent()) return newCompose.draftId;
+    const payload = {
+      account_id: filterAccountId,
+      author_id: userId,
+      to_addresses: newCompose.to.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean),
+      cc_addresses: newCompose.cc.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean),
+      bcc_addresses: newCompose.bcc.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean),
+      subject: newCompose.subject,
+      body_text: newCompose.body,
+      generated_by_ai: false,
+      status: "draft" as const,
+    };
+    if (newCompose.draftId) {
+      const { error } = await mail.from("drafts").update(payload).eq("id", newCompose.draftId);
+      if (error) { alert(`下書き保存失敗: ${error.message}`); return null; }
+      return newCompose.draftId;
+    }
+    const { data, error } = await mail.from("drafts").insert(payload).select("id").single();
+    if (error) { alert(`下書き保存失敗: ${error.message}`); return null; }
+    newCompose.draftId = data!.id as string;
+    return newCompose.draftId;
+  }
+
+  // モーダル外クリック: 内容があれば下書き保存、無ければそのまま閉じる
+  async function closeNewComposeAsDraft() {
+    if (newComposeHasContent()) {
+      await saveNewComposeDraft();
+    }
+    newComposeOpen = false;
+  }
+
+  async function sendNewCompose() {
+    if (!filterAccountId) return;
+    if (!newCompose.to.trim()) { alert("宛先を入力してください"); return; }
+    if (!confirm("この内容で送信しますか？")) return;
+    newComposeSending = true;
+    try {
+      const id = await saveNewComposeDraft();
+      if (!id) throw new Error("下書き保存に失敗");
+      const res = await fetch(fnUrl("send-mail"), {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(await authHeader()) },
+        body: JSON.stringify({ draft_id: id }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "failed");
+      alert("送信しました");
+      newComposeOpen = false;
+    } catch (e) {
+      alert(`送信失敗: ${(e as Error).message}`);
+    } finally {
+      newComposeSending = false;
+    }
   }
 
   // AI 設定 (トーン) 編集モーダル
@@ -1002,18 +1088,18 @@
   <aside class="threads">
     {#if currentAccount}
       <header class="inbox-header">
-        <div class="inbox-header-title">
+        <div class="inbox-header-row inbox-header-title">
           {#if currentAccount.is_shared}
             <span class="shared-badge" title="共有">共</span>
           {/if}
           <span class="inbox-acct-label">{currentAccount.label}</span>
         </div>
-        <div class="inbox-header-actions">
-          <a
+        <div class="inbox-header-row inbox-header-actions">
+          <button
             class="ih-btn primary"
-            href={`/compose?account=${currentAccount.id}`}
+            onclick={openNewCompose}
             title="このアカウントから新規作成"
-          >✉ 新規作成</a>
+          >✉ 新規作成</button>
           <button
             class="ih-btn"
             onclick={openToneModal}
@@ -1035,7 +1121,7 @@
           onmouseenter={() => (hoverThreadId = t.id)}
           onmouseleave={() => (hoverThreadId = null)}
           role="presentation"
-          use:swipeable={{ threshold: -100, onSwipe: () => softDeleteThread(t.id) }}
+          use:swipeable={{ threshold: -300, onSwipe: () => softDeleteThread(t.id) }}
         >
           <button class="thread" onclick={() => openThread(t)}>
             <div class="meta">
@@ -1215,6 +1301,60 @@
     {/if}
   </section>
 </div>
+
+{#if newComposeOpen && currentAccount}
+  <div
+    class="modal-backdrop"
+    role="presentation"
+    onclick={closeNewComposeAsDraft}
+  >
+    <div
+      class="compose-modal"
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => { if (e.key === "Escape") { void closeNewComposeAsDraft(); } }}
+    >
+      <header class="cm-header">
+        <h3>新規メール</h3>
+        <span class="cm-acct">送信元: <strong>{currentAccount.label}</strong></span>
+      </header>
+      <div class="cm-fields">
+        <label class="cm-field">
+          <span>To</span>
+          <input type="text" bind:value={newCompose.to} placeholder="a@example.com, b@example.com" />
+        </label>
+        <label class="cm-field">
+          <span>Cc</span>
+          <input type="text" bind:value={newCompose.cc} placeholder="(任意)" />
+        </label>
+        <label class="cm-field">
+          <span>Bcc</span>
+          <input type="text" bind:value={newCompose.bcc} placeholder="(任意)" />
+        </label>
+        <label class="cm-field">
+          <span>件名</span>
+          <input type="text" bind:value={newCompose.subject} />
+        </label>
+      </div>
+      <textarea
+        class="cm-body"
+        rows="14"
+        bind:value={newCompose.body}
+        placeholder="本文を入力…"
+      ></textarea>
+      <footer class="cm-actions">
+        <span class="cm-hint">モーダル外クリック / Esc で下書き保存して閉じます</span>
+        <span class="cm-spacer"></span>
+        <button onclick={saveNewComposeDraft}>下書き保存</button>
+        <button class="primary" onclick={sendNewCompose} disabled={newComposeSending}>
+          {newComposeSending ? "送信中…" : "▶ 送信"}
+        </button>
+      </footer>
+    </div>
+  </div>
+{/if}
 
 {#if toneModalOpen && currentAccount}
   <div class="modal-backdrop" role="presentation" onclick={() => (toneModalOpen = false)}>
@@ -1461,31 +1601,32 @@
     z-index: 3;
     background: #fff;
     border-bottom: 1px solid #e5e7eb;
-    padding: 0.55rem 0.75rem;
+    padding: 0.5rem 0.75rem 0.6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .inbox-header-row {
     display: flex;
     align-items: center;
     gap: 0.5rem;
   }
-  .inbox-header-title {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-  }
+  .inbox-header-title { min-height: 1.6rem; }
   .inbox-acct-label {
     font-weight: 700;
-    font-size: 0.95rem;
+    font-size: 1rem;
     color: #111;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .inbox-header-actions { display: flex; gap: 0.35rem; flex-shrink: 0; }
+  .inbox-header-actions { gap: 0.5rem; }
   .ih-btn {
-    font-size: 0.82rem;
-    padding: 0.4rem 0.7rem;
-    border-radius: 4px;
+    flex: 1;
+    font-size: 0.92rem;
+    font-weight: 600;
+    padding: 0.55rem 0.6rem;
+    border-radius: 6px;
     border: 1px solid #d1d5db;
     background: #fff;
     color: #374151;
@@ -1493,6 +1634,7 @@
     text-decoration: none;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     white-space: nowrap;
   }
   .ih-btn:hover { background: #f3f4f6; }
@@ -1834,6 +1976,89 @@
     background: #fafafa;
     border-radius: 0 4px 4px 0;
   }
+
+  /* ===== 新規作成モーダル ===== */
+  .compose-modal {
+    background: #fff;
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem 1rem;
+    width: min(720px, 94vw);
+    max-height: 92vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.25);
+  }
+  .cm-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    border-bottom: 1px solid #e5e7eb;
+    padding-bottom: 0.6rem;
+  }
+  .cm-header h3 { margin: 0; font-size: 1.05rem; }
+  .cm-acct { color: #6b7280; font-size: 0.82rem; }
+  .cm-fields { display: flex; flex-direction: column; }
+  .cm-field {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    border-bottom: 1px solid #f3f4f6;
+    padding: 0.4rem 0;
+  }
+  .cm-field > span {
+    width: 3rem;
+    color: #6b7280;
+    font-size: 0.8rem;
+    flex-shrink: 0;
+  }
+  .cm-field > input {
+    flex: 1;
+    border: none;
+    outline: none;
+    padding: 0.25rem 0;
+    font-size: 0.95rem;
+    font-family: inherit;
+    background: transparent;
+  }
+  .cm-body {
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    padding: 0.7rem;
+    font-family: inherit;
+    font-size: 0.95rem;
+    line-height: 1.6;
+    resize: vertical;
+    min-height: 220px;
+    margin-top: 0.4rem;
+  }
+  .cm-body:focus { outline: 2px solid #bfdbfe; border-color: #60a5fa; }
+  .cm-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid #e5e7eb;
+  }
+  .cm-hint { font-size: 0.72rem; color: #9ca3af; }
+  .cm-spacer { flex: 1; }
+  .cm-actions button {
+    padding: 0.5rem 1rem;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  .cm-actions button:hover:not(:disabled) { background: #f3f4f6; }
+  .cm-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .cm-actions .primary {
+    background: #2563eb;
+    color: #fff;
+    border: none;
+  }
+  .cm-actions .primary:hover:not(:disabled) { background: #1d4ed8; }
 
   /* ===== AI トーン設定モーダル ===== */
   .modal-backdrop {
