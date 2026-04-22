@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.7.3",
+    date: "2026-04-22",
+    changes: [
+      "imap-sync の last_uid 自動復旧: last_uid=0 だが DB にメッセージがある場合は DB の最大 UID を採用して forward sync の起点にする (途中 hang で last_uid が保存されなかった場合の自動復旧)",
+      "fetchOne に 15 秒のタイムアウト追加: 特定メッセージで imapflow が永久待ちになっても、そのアカウントだけ中断して次回リトライ。他のアカウントの sync は影響を受けない",
+      "3 件ごとに last_uid を DB にチェックポイント保存: 途中でシャットダウンしても次回は続きから再開できる",
+    ],
+  },
+  {
     version: "0.7.2",
     date: "2026-04-22",
     changes: [

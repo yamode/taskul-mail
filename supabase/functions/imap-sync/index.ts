@@ -164,16 +164,36 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     let maxSeenUid = effectiveLastUid;
     const touchedThreads = new Map<string, string>();
 
-    // 同期済みの最古 UID を取得 (backfill の起点)
-    const { data: oldestRow } = await sb
-      .from("messages")
-      .select("imap_uid")
-      .eq("account_id", account.id)
-      .order("imap_uid", { ascending: true })
-      .limit(1)
-      .maybeSingle();
+    // 同期済みの最古・最新 UID を DB から取得
+    const [{ data: oldestRow }, { data: newestRow }] = await Promise.all([
+      sb.from("messages")
+        .select("imap_uid")
+        .eq("account_id", account.id)
+        .order("imap_uid", { ascending: true })
+        .limit(1)
+        .maybeSingle(),
+      sb.from("messages")
+        .select("imap_uid")
+        .eq("account_id", account.id)
+        .order("imap_uid", { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+    ]);
     const oldestSyncedUid = oldestRow ? Number(oldestRow.imap_uid) : null;
+    const newestSyncedUid = newestRow ? Number(newestRow.imap_uid) : null;
     diag.oldest_synced_uid = oldestSyncedUid;
+    diag.newest_synced_uid = newestSyncedUid;
+
+    // lastUid が 0 にリセットされているが DB にメッセージが存在する場合、
+    // DB の最大 UID を lastUid として採用 (過去の sync が途中で落ちて last_uid が
+    // 更新されなかった場合の自動復旧)。これをやらないと forward search が UID 1 から
+    // スキャンして既に DB にある古い UID を再フェッチし続けてしまう。
+    if (effectiveLastUid === 0 && newestSyncedUid !== null) {
+      console.log(`[${account.email_address}] RECOVER lastUid=${newestSyncedUid} from DB`);
+      effectiveLastUid = newestSyncedUid;
+      fromUid = newestSyncedUid + 1;
+      maxSeenUid = newestSyncedUid;
+    }
 
     // 同期モード判定:
     // - first: まだ何も同期していない → sequence 末尾から N 件
@@ -221,19 +241,38 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     diag.target_uid_count = targetUids.length;
 
     // 全モードで SEARCH → fetchOne 統一 (range fetch は一切使わない)
+    // 個々の fetchOne に 15 秒の wall-clock タイムアウトを付ける。
+    // 特定の壊れた/巨大メッセージで imapflow が永久待ち状態になっても、
+    // この 1 通だけスキップして先に進める (該当 UID は次回の sync でリトライ)。
+    const FETCH_TIMEOUT_MS = 15_000;
+    const skippedUids: number[] = [];
     const fetchIter = (async function* () {
       for (let i = 0; i < targetUids.length; i++) {
         const uid = targetUids[i];
         console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} begin`);
-        const one = await client.fetchOne(
-          String(uid),
-          { uid: true, envelope: true, source: true, internalDate: true },
-          { uid: true },
-        );
-        console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} end gotSrc=${!!(one as { source?: unknown })?.source}`);
-        if (one) yield one as never;
+        try {
+          const one = await Promise.race([
+            client.fetchOne(
+              String(uid),
+              { uid: true, envelope: true, source: true, internalDate: true },
+              { uid: true },
+            ),
+            new Promise<never>((_, rej) =>
+              setTimeout(() => rej(new Error(`fetchOne_timeout uid=${uid}`)), FETCH_TIMEOUT_MS),
+            ),
+          ]);
+          console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} end gotSrc=${!!(one as { source?: unknown })?.source}`);
+          if (one) yield one as never;
+        } catch (e) {
+          console.warn(`[${account.email_address}] fetchOne uid=${uid} FAILED: ${(e as Error).message}`);
+          skippedUids.push(uid);
+          // タイムアウト後は imapflow の内部状態が壊れている可能性が高いので
+          // このアカウントの同期はここで打ち切り、次回以降にリトライする。
+          break;
+        }
       }
     })();
+    diag.skipped_uids = skippedUids;
     console.log(`[${account.email_address}] START mode=${mode} targetUids=${targetUids.length} exists=${exists} lastUid=${effectiveLastUid} actualMaxUid=${actualMaxUid} oldestSyncedUid=${oldestSyncedUid}`);
     for await (const msg of fetchIter) {
       if (processed >= MAX_PER_RUN) break;
@@ -351,8 +390,17 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       touchedThreads.set(threadId!, (parsed.date ?? new Date()).toISOString());
 
       if (Number(msg.uid) > maxSeenUid) maxSeenUid = Number(msg.uid);
+
+      // 3 件ごとに last_uid を DB にチェックポイント保存。
+      // 途中で wall-clock shutdown / hang しても次回 sync 時に続きから再開できる。
+      if (processed % 3 === 0) {
+        await sb
+          .from("accounts")
+          .update({ last_uid: maxSeenUid, last_uidvalidity: Number(mailbox.uidValidity) })
+          .eq("id", account.id);
+      }
     }
-    console.log(`[${account.email_address}] FETCH LOOP DONE processed=${processed}`);
+    console.log(`[${account.email_address}] FETCH LOOP DONE processed=${processed} skipped=${skippedUids.length}`);
 
     // 触ったスレッドの message_count と last_message_at をまとめて更新
     for (const [tid, lastAt] of touchedThreads) {
