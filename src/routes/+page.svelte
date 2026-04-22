@@ -25,7 +25,7 @@
     received_at: string;
     direction: string;
   };
-  type Account = { id: string; label: string; is_shared: boolean };
+  type Account = { id: string; label: string; is_shared: boolean; sort_order?: number; unread_count?: number };
 
   let threads = $state<Thread[]>([]);
   let accounts = $state<Account[]>([]);
@@ -92,9 +92,34 @@
   async function loadAccounts() {
     const { data } = await mail
       .from("accounts")
-      .select("id,label,is_shared")
+      .select("id,label,is_shared,sort_order")
+      .order("sort_order")
       .order("created_at");
     accounts = (data ?? []) as Account[];
+  }
+
+  // D&D 並び替え: sort_order をまとめて更新。楽観的に UI を先に更新し、失敗したら再読込。
+  let dragId = $state<string | null>(null);
+  async function onDropAccount(targetId: string) {
+    if (!dragId || dragId === targetId) return;
+    const reordered = [...accounts];
+    const from = reordered.findIndex((a) => a.id === dragId);
+    const to = reordered.findIndex((a) => a.id === targetId);
+    if (from < 0 || to < 0) return;
+    const [moved] = reordered.splice(from, 1);
+    reordered.splice(to, 0, moved);
+    accounts = reordered;
+    dragId = null;
+    try {
+      await Promise.all(
+        reordered.map((a, i) =>
+          mail.from("accounts").update({ sort_order: i + 1 }).eq("id", a.id),
+        ),
+      );
+    } catch (e) {
+      console.error("reorder failed", e);
+      await loadAccounts();
+    }
   }
 
   async function loadThreads() {
@@ -306,16 +331,39 @@
 </script>
 
 <div class="layout">
-  <aside class="threads">
-    <div class="filter">
-      <select bind:value={filterAccountId}>
-        <option value="all">すべてのアカウント</option>
-        {#each accounts as a}
-          <option value={a.id}>{a.label}</option>
-        {/each}
-      </select>
-      <button class="reload" onclick={loadThreads} title="再読込">↻</button>
+  <aside class="accounts">
+    <button
+      class="account"
+      class:selected={filterAccountId === "all"}
+      onclick={() => (filterAccountId = "all")}
+    >
+      <span class="account-label">すべて</span>
+    </button>
+    {#each accounts as a (a.id)}
+      <button
+        class="account"
+        class:selected={filterAccountId === a.id}
+        class:shared={a.is_shared}
+        draggable="true"
+        ondragstart={() => (dragId = a.id)}
+        ondragover={(e) => e.preventDefault()}
+        ondrop={() => onDropAccount(a.id)}
+        onclick={() => (filterAccountId = a.id)}
+      >
+        <span class="grip" title="ドラッグで並び替え">⋮⋮</span>
+        <span class="account-label">{a.label}</span>
+        {#if a.is_shared}
+          <span class="shared-badge" title="共有アカウント">共</span>
+        {/if}
+      </button>
+    {/each}
+    <div class="accounts-footer">
+      <button class="reload" onclick={() => { void syncTick(); loadThreads(); }} title="再同期">
+        {syncing ? "同期中..." : "↻ 再同期"}
+      </button>
     </div>
+  </aside>
+  <aside class="threads">
     {#each filtered as t}
       <button
         class="thread"
@@ -409,37 +457,67 @@
 <style>
   .layout {
     display: grid;
-    grid-template-columns: 340px 1fr;
+    grid-template-columns: 200px 340px 1fr;
     height: calc(100vh - 56px);
   }
+  .accounts {
+    overflow-y: auto;
+    background: #f3f4f6;
+    border-right: 1px solid #e5e7eb;
+    padding: 0.5rem 0.4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .account {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 0.45rem 0.5rem;
+    cursor: pointer;
+    text-align: left;
+    font-size: 0.88rem;
+    color: #374151;
+  }
+  .account:hover { background: #e5e7eb; }
+  .account.selected {
+    background: #fff;
+    border-color: #d1d5db;
+    font-weight: 600;
+    color: #111;
+  }
+  .account .grip {
+    color: #9ca3af;
+    font-size: 0.7rem;
+    cursor: grab;
+    user-select: none;
+  }
+  .account-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .shared-badge {
+    background: #dbeafe;
+    color: #1e40af;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+  }
+  .accounts-footer { margin-top: auto; padding-top: 0.5rem; }
+  .accounts-footer .reload {
+    width: 100%;
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    padding: 0.4rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .accounts-footer .reload:hover { background: #f9fafb; }
   .threads {
     overflow-y: auto;
     border-right: 1px solid #e5e7eb;
     background: #fff;
-  }
-  .filter {
-    display: flex;
-    gap: 0.5rem;
-    padding: 0.75rem;
-    border-bottom: 1px solid #e5e7eb;
-    position: sticky;
-    top: 0;
-    background: #fff;
-    z-index: 1;
-  }
-  .filter select {
-    flex: 1;
-    padding: 0.4rem;
-    border: 1px solid #d1d5db;
-    border-radius: 4px;
-  }
-  .reload {
-    padding: 0.4rem 0.6rem;
-    background: #f3f4f6;
-    color: #374151;
-    border: 1px solid #d1d5db;
-    border-radius: 4px;
-    cursor: pointer;
   }
   .thread {
     display: block;

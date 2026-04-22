@@ -6,6 +6,16 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.3.0",
+    date: "2026-04-22",
+    changes: [
+      "受信トレイ UI を刷新: ドロップダウンのアカウント切替を撤去し、縦に並ぶアカウントリストから 1 クリックで切替可能に",
+      "メールアカウントの D&D 並び替えに対応 (mail.accounts.sort_order カラム追加、楽観的 UI 更新)",
+      "再同期ボタンを強化: 押すと IMAP 同期 → スレッド再読込を1回で実行、同期中は「同期中...」表示",
+      "共有アカウントには「共」バッジを表示",
+    ],
+  },
+  {
     version: "0.2.5",
     date: "2026-04-22",
     changes: [
