@@ -252,6 +252,10 @@
   onMount(async () => {
     try {
       accountsCollapsed = localStorage.getItem("taskul-mail.accounts-collapsed") === "1";
+      const savedAcct = Number(localStorage.getItem("taskul-mail.col-accounts"));
+      if (Number.isFinite(savedAcct) && savedAcct > 0) colAccounts = clampAcct(savedAcct);
+      const savedThr = Number(localStorage.getItem("taskul-mail.col-threads"));
+      if (Number.isFinite(savedThr) && savedThr > 0) colThreads = clampThr(savedThr);
     } catch { /* ignore */ }
     const { data: { user } } = await supabase.auth.getUser();
     userId = user?.id ?? null;
@@ -539,6 +543,54 @@
     try {
       localStorage.setItem("taskul-mail.accounts-collapsed", accountsCollapsed ? "1" : "0");
     } catch { /* ignore */ }
+  }
+
+  // 3 カラムの幅 (px)。ドラッグハンドルで調整、localStorage で永続化。
+  //   col1: アカウントサイドバー、col2: スレッド一覧、col3: 残り (1fr)
+  const COL_ACCOUNTS_MIN = 120, COL_ACCOUNTS_MAX = 400;
+  const COL_THREADS_MIN = 240, COL_THREADS_MAX = 600;
+  let colAccounts = $state(200);
+  let colThreads = $state(340);
+  function clampAcct(v: number) { return Math.max(COL_ACCOUNTS_MIN, Math.min(COL_ACCOUNTS_MAX, v)); }
+  function clampThr(v: number) { return Math.max(COL_THREADS_MIN, Math.min(COL_THREADS_MAX, v)); }
+
+  function startColResize(which: "accounts" | "threads", e: PointerEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startAcct = colAccounts;
+    const startThr = colThreads;
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    const onMove = (ev: PointerEvent) => {
+      const dx = ev.clientX - startX;
+      if (which === "accounts") colAccounts = clampAcct(startAcct + dx);
+      else colThreads = clampThr(startThr + dx);
+    };
+    const onUp = () => {
+      target.removeEventListener("pointermove", onMove);
+      target.removeEventListener("pointerup", onUp);
+      target.removeEventListener("pointercancel", onUp);
+      try {
+        localStorage.setItem("taskul-mail.col-accounts", String(colAccounts));
+        localStorage.setItem("taskul-mail.col-threads", String(colThreads));
+      } catch { /* ignore */ }
+    };
+    target.addEventListener("pointermove", onMove);
+    target.addEventListener("pointerup", onUp);
+    target.addEventListener("pointercancel", onUp);
+  }
+
+  // メモパネルを手動で開いているスレッド (メモ 0 件でも表示)
+  let memoOpenByThread = $state<Record<string, boolean>>({});
+  function toggleMemoOpen(tid: string) {
+    memoOpenByThread = { ...memoOpenByThread, [tid]: !memoOpenByThread[tid] };
+    // 開いた直後はメモ入力欄にフォーカス
+    if (memoOpenByThread[tid]) {
+      setTimeout(() => {
+        const ta = document.querySelector<HTMLTextAreaElement>(".thread-memo textarea");
+        ta?.focus();
+      }, 30);
+    }
   }
 
   let dragId = $state<string | null>(null);
@@ -912,7 +964,7 @@
 
   async function trashThread(t: Thread, e: Event) {
     e.stopPropagation();
-    if (!confirm(`「${t.subject_normalized || "(件名なし)"}」をゴミ箱へ移動しますか？`)) return;
+    // 確認ダイアログは廃止 (undo トーストで 5 秒以内は復元可能)
     await softDeleteThread(t.id);
   }
 
@@ -1488,7 +1540,12 @@
   }
 </script>
 
-<div class="layout" class:accounts-collapsed={accountsCollapsed}>
+<div
+  class="layout"
+  class:accounts-collapsed={accountsCollapsed}
+  style:--col-accounts={accountsCollapsed ? "52px" : `${colAccounts}px`}
+  style:--col-threads={`${colThreads}px`}
+>
   <aside class="accounts" class:collapsed={accountsCollapsed}>
     <button
       class="toggle-collapse"
@@ -1577,6 +1634,15 @@
       </div>
     </div>
   </aside>
+
+  {#if !accountsCollapsed}
+    <div
+      class="col-resizer"
+      role="separator"
+      aria-label="アカウント列の幅を調整"
+      onpointerdown={(e) => startColResize("accounts", e)}
+    ></div>
+  {/if}
 
   <aside class="threads">
     {#if currentAccount}
@@ -1668,6 +1734,13 @@
     {/if}
   </aside>
 
+  <div
+    class="col-resizer"
+    role="separator"
+    aria-label="スレッド一覧の幅を調整"
+    onpointerdown={(e) => startColResize("threads", e)}
+  ></div>
+
   <section class="detail">
     {#if view === "drafts" && currentAccount}
       <!-- ===== アカウント別 下書き一覧 & 編集 ===== -->
@@ -1736,113 +1809,152 @@
     {:else if !selectedThreadId && !compose}
       <p class="empty">スレッドを選択してください</p>
     {:else}
-      {#if selectedThreadId}
-        {@const tid = selectedThreadId}
-        {@const saving = threadCommentSaving[tid] ?? false}
-        {@const draft = threadCommentDraft[tid] ?? ""}
-        <!-- ===== スレッド横断 社内メモ (compose 中も常時表示) ===== -->
-        <div class="thread-memo" role="region" aria-label="社内メモ">
-          <div class="comments-head">
-            <span class="comments-title">💬 社内メモ</span>
-            {#if threadComments.length > 0}
-              <span class="comments-count">{threadComments.length} 件</span>
-            {/if}
-            <span class="comments-hint">このメモはメール送信されません</span>
-          </div>
-          {#if threadComments.length === 0}
-            <p class="comments-empty">まだメモはありません</p>
-          {:else}
-            <ul class="comment-list">
-              {#each threadComments as c (c.id)}
-                <li class="comment" class:own={c.author_id === userId}>
-                  <div class="comment-meta">
-                    <strong>{commentAuthorLabel(c)}</strong>
-                    <span class="comment-time">{formatCommentTime(c.created_at)}</span>
-                    {#if c.author_id === userId}
-                      <button
-                        class="comment-del"
-                        title="削除"
-                        onclick={() => void deleteComment(c)}
-                      >✕</button>
-                    {/if}
-                  </div>
-                  <pre class="comment-body">{c.body}</pre>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-          <div class="comment-input">
-            <textarea
-              rows="2"
-              placeholder="例: 明日ひかるさんが返信予定 / 要確認: 請求内容"
-              value={draft}
-              oninput={(e) => (threadCommentDraft = { ...threadCommentDraft, [tid]: (e.currentTarget as HTMLTextAreaElement).value })}
-              onkeydown={(e) => {
-                if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-                  e.preventDefault();
-                  void addThreadComment(tid);
-                }
-              }}
-            ></textarea>
-            <button
-              class="primary"
-              disabled={saving || !draft.trim()}
-              onclick={() => void addThreadComment(tid)}
-            >
-              {saving ? "投稿中…" : "投稿 (⌘/Ctrl+Enter)"}
-            </button>
-          </div>
-        </div>
-      {/if}
-      {#if compose}
-      {@const composeAcct = accounts.find((a) => {
-        const src = messages.find((m) => m.id === compose!.sourceMessageId);
-        return a.id === src?.account_id;
-      })}
-      {@const baseTone = composeAcct?.default_tone ?? ""}
-      <!-- ===== 返信/転送インライン展開 ===== -->
-      <header class="compose-header">
-        <div class="compose-header-row">
-          <button class="back" onclick={cancelCompose} title="キャンセル">← 戻る</button>
-          <span class="compose-mode">
-            {compose.mode === "reply" ? "↩ 返信を作成" : "→ 転送を作成"}
-          </span>
-          <button
-            class="ai"
-            onclick={generateDraft}
-            disabled={generating || compose.mode !== "reply"}
-            title="Claude で再生成 (アカウント基本トーン + 追加指示)"
-          >
-            {generating ? "生成中…" : "✨ 再生成"}
-          </button>
-          <span class="spacer"></span>
-          <button class="ghost" onclick={cancelCompose} title="下書きを破棄">破棄</button>
-          <button class="ghost" onclick={saveCompose} title="下書きとして保存">下書き保存</button>
-          <button class="primary" onclick={sendCompose} disabled={sending}>
-            {sending ? "送信中…" : "▶ 送信"}
-          </button>
-        </div>
-        {#if compose.mode === "reply"}
-          <div class="compose-header-row tone-row">
-            <div class="tone-base" title="このアカウントの既定トーン (アカウント設定で変更)">
-              <span class="tone-base-label">基本トーン</span>
-              {#if baseTone}
-                <span class="tone-base-value">{baseTone}</span>
-              {:else}
-                <a class="tone-base-empty" href="/accounts">未設定 — アカウント設定で登録</a>
+      <!-- ========== sticky ヘッダ (メモ + ツールバー/compose-header) ========== -->
+      <div class="detail-sticky">
+        {#if selectedThreadId}
+          {@const tid = selectedThreadId}
+          {@const saving = threadCommentSaving[tid] ?? false}
+          {@const draft = threadCommentDraft[tid] ?? ""}
+          {@const memoShown = threadComments.length > 0 || !!memoOpenByThread[tid]}
+          {#if memoShown}
+            <div class="thread-memo" role="region" aria-label="社内メモ">
+              <div class="comments-head">
+                <span class="comments-title">💬 社内メモ</span>
+                {#if threadComments.length > 0}
+                  <span class="comments-count">{threadComments.length} 件</span>
+                {/if}
+                <span class="comments-hint">このメモはメール送信されません</span>
+                <span class="spacer"></span>
+                <button
+                  class="memo-close"
+                  title="メモパネルを閉じる"
+                  aria-label="メモパネルを閉じる"
+                  onclick={() => toggleMemoOpen(tid)}
+                  disabled={threadComments.length > 0}
+                >✕</button>
+              </div>
+              {#if threadComments.length > 0}
+                <ul class="comment-list">
+                  {#each threadComments as c (c.id)}
+                    <li class="comment" class:own={c.author_id === userId}>
+                      <div class="comment-meta">
+                        <strong>{commentAuthorLabel(c)}</strong>
+                        <span class="comment-time">{formatCommentTime(c.created_at)}</span>
+                        {#if c.author_id === userId}
+                          <button
+                            class="comment-del"
+                            title="削除"
+                            onclick={() => void deleteComment(c)}
+                          >✕</button>
+                        {/if}
+                      </div>
+                      <pre class="comment-body">{c.body}</pre>
+                    </li>
+                  {/each}
+                </ul>
               {/if}
+              <div class="comment-input">
+                <textarea
+                  rows="2"
+                  placeholder="例: 明日ひかるさんが返信予定 / 要確認: 請求内容"
+                  value={draft}
+                  oninput={(e) => (threadCommentDraft = { ...threadCommentDraft, [tid]: (e.currentTarget as HTMLTextAreaElement).value })}
+                  onkeydown={(e) => {
+                    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                      e.preventDefault();
+                      void addThreadComment(tid);
+                    }
+                  }}
+                ></textarea>
+                <button
+                  class="primary"
+                  disabled={saving || !draft.trim()}
+                  onclick={() => void addThreadComment(tid)}
+                >
+                  {saving ? "投稿中…" : "投稿 (⌘/Ctrl+Enter)"}
+                </button>
+              </div>
             </div>
-            <label class="tone-hint">
-              <span>追加指示</span>
-              <input
-                type="text"
-                placeholder="例: 今回は特に急ぎで、日程を 2 案提示して (空欄可)"
-                bind:value={hint}
-              />
-            </label>
-          </div>
+          {/if}
         {/if}
-      </header>
+        {#if compose}
+          {@const composeAcct = accounts.find((a) => {
+            const src = messages.find((m) => m.id === compose!.sourceMessageId);
+            return a.id === src?.account_id;
+          })}
+          {@const baseTone = composeAcct?.default_tone ?? ""}
+          <header class="compose-header">
+            <div class="compose-header-row">
+              <button class="back" onclick={cancelCompose} title="キャンセル">← 戻る</button>
+              <span class="compose-mode">
+                {compose.mode === "reply" ? "↩ 返信を作成" : "→ 転送を作成"}
+              </span>
+              <button
+                class="ai"
+                onclick={generateDraft}
+                disabled={generating || compose.mode !== "reply"}
+                title="Claude で再生成 (アカウント基本トーン + 追加指示)"
+              >
+                {generating ? "生成中…" : "✨ 再生成"}
+              </button>
+              <span class="spacer"></span>
+              <button class="ghost" onclick={cancelCompose} title="下書きを破棄">破棄</button>
+              <button class="ghost" onclick={saveCompose} title="下書きとして保存">下書き保存</button>
+              <button class="primary" onclick={sendCompose} disabled={sending}>
+                {sending ? "送信中…" : "▶ 送信"}
+              </button>
+            </div>
+            {#if compose.mode === "reply"}
+              <div class="compose-header-row tone-row">
+                <div class="tone-base" title="このアカウントの既定トーン (アカウント設定で変更)">
+                  <span class="tone-base-label">基本トーン</span>
+                  {#if baseTone}
+                    <span class="tone-base-value">{baseTone}</span>
+                  {:else}
+                    <a class="tone-base-empty" href="/accounts">未設定 — アカウント設定で登録</a>
+                  {/if}
+                </div>
+                <label class="tone-hint">
+                  <span>追加指示</span>
+                  <input
+                    type="text"
+                    placeholder="例: 今回は特に急ぎで、日程を 2 案提示して (空欄可)"
+                    bind:value={hint}
+                  />
+                </label>
+              </div>
+            {/if}
+          </header>
+        {:else}
+          <header class="detail-toolbar">
+            <button onclick={() => startReply(false)} disabled={!selectedMessageId}>
+              ↩ 返信
+            </button>
+            <button onclick={() => startReply(true)} disabled={!selectedMessageId}>
+              ↩↩ 全員に返信
+            </button>
+            <button onclick={() => startForward()} disabled={!selectedMessageId}>
+              → 転送
+            </button>
+            {#if selectedThreadId}
+              <button
+                onclick={() => toggleMemoOpen(selectedThreadId!)}
+                title="スレッド横断の社内メモを追加"
+                class:active={threadComments.length > 0 || !!memoOpenByThread[selectedThreadId!]}
+              >
+                💬 メモ{#if threadComments.length > 0} ({threadComments.length}){/if}
+              </button>
+            {/if}
+            <span class="spacer"></span>
+            <button onclick={generateDraft} disabled={generating || !selectedMessageId}>
+              {generating ? "生成中…" : "✨ Claude 下書き"}
+            </button>
+          </header>
+        {/if}
+      </div><!-- /.detail-sticky -->
+
+      <!-- ========== 本体 (sticky 外) ========== -->
+      {#if compose}
       <div class="compose">
         <div class="field-row">
           <label class="field">
@@ -1894,23 +2006,7 @@
           {/if}
         {/if}
       </div>
-    {:else}
-      <!-- ===== スレッド表示 ===== -->
-      <header class="detail-toolbar">
-        <button onclick={() => startReply(false)} disabled={!selectedMessageId}>
-          ↩ 返信
-        </button>
-        <button onclick={() => startReply(true)} disabled={!selectedMessageId}>
-          ↩↩ 全員に返信
-        </button>
-        <button onclick={() => startForward()} disabled={!selectedMessageId}>
-          → 転送
-        </button>
-        <span class="spacer"></span>
-        <button onclick={generateDraft} disabled={generating || !selectedMessageId}>
-          {generating ? "生成中…" : "✨ Claude 下書き"}
-        </button>
-      </header>
+      {:else}
       {#each messages as m}
         <div
           class="message"
@@ -2111,12 +2207,30 @@
 <style>
   .layout {
     display: grid;
-    grid-template-columns: 200px 340px 1fr;
+    /* 各カラム幅は CSS var で注入 (JS 側がドラッグで更新)。
+       accounts | [resizer 6px] | threads | [resizer 6px] | detail */
+    grid-template-columns: var(--col-accounts, 200px) 6px var(--col-threads, 340px) 6px 1fr;
     height: calc(100vh - 56px);
-    transition: grid-template-columns 180ms ease-out;
   }
   .layout.accounts-collapsed {
-    grid-template-columns: 52px 340px 1fr;
+    /* collapsed 時はアカウント列のリサイザを非表示にする (<div>自体を描画しない) */
+    grid-template-columns: var(--col-accounts, 52px) var(--col-threads, 340px) 6px 1fr;
+  }
+  .col-resizer {
+    background: transparent;
+    cursor: col-resize;
+    position: relative;
+    z-index: 4;
+  }
+  .col-resizer::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-left: 1px solid #e5e7eb;
+  }
+  .col-resizer:hover::before {
+    border-left-color: #60a5fa;
+    box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.5);
   }
   .accounts {
     overflow-y: auto;
@@ -2448,8 +2562,15 @@
   .detail .message { margin-left: 1rem; margin-right: 1rem; }
   .detail .message:first-of-type { margin-top: 1rem; }
   .empty { color: #999; text-align: center; margin-top: 4rem; padding: 0 1rem; }
+  /* メモ + ツールバー / compose-header を包む sticky 単位。
+     個別 sticky だと top:0 が重なって後ろに隠れるため、グループ化して stack する。 */
+  .detail-sticky {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    background: #fff;
+  }
   .detail-toolbar {
-    position: sticky; top: 0; z-index: 2;
     display: flex; align-items: center; gap: 0.5rem;
     padding: 0.6rem 1rem;
     background: #fff;
@@ -2579,7 +2700,6 @@
 
   /* ===== Compose (inline reply/forward) ===== */
   .compose-header {
-    position: sticky; top: 0; z-index: 2;
     display: flex;
     flex-direction: column;
     gap: 0.4rem;
@@ -2989,11 +3109,6 @@
     color: #9ca3af;
     font-size: 0.72rem;
   }
-  .comments-empty {
-    margin: 0 0 0.5rem;
-    color: #9ca3af;
-    font-size: 0.82rem;
-  }
   .comment-list {
     list-style: none;
     margin: 0 0 0.5rem;
@@ -3074,18 +3189,40 @@
     cursor: not-allowed;
   }
 
-  /* スレッドヘッダに置く社内メモ (メッセージ横断で集約) */
+  /* スレッドヘッダに置く社内メモ (メッセージ横断で集約)。
+     sticky 指定は .detail-sticky が担うのでここでは外す。 */
   .thread-memo {
-    position: sticky;
-    top: 0;
-    z-index: 3;
     margin: 0;
     background: #fffbeb;
     border-bottom: 1px solid #fde68a;
     padding: 0.6rem 1rem 0.75rem;
   }
-  .thread-memo .comments-head { margin-bottom: 0.4rem; }
+  .thread-memo .comments-head {
+    margin-bottom: 0.4rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .thread-memo .comments-head .spacer { flex: 1; }
   .thread-memo .comment-list { max-height: 20vh; overflow-y: auto; }
+  .memo-close {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #92400e;
+    cursor: pointer;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.9rem;
+  }
+  .memo-close:hover:not(:disabled) { background: #fef3c7; border-color: #fcd34d; }
+  .memo-close:disabled { opacity: 0; cursor: default; }
+
+  /* 返信/Claude 行のメモトグルボタンのアクティブ状態 */
+  .detail-toolbar button.active {
+    background: #fef3c7;
+    border-color: #fcd34d;
+    color: #92400e;
+  }
 
   /* 下書きビュー */
   .drafts-header {
