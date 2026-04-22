@@ -52,6 +52,48 @@ Courier の LOGIN コマンドがパスワード `}` で拒否されるかもし
 - メールボックス構成（Sent / Drafts / Trash / Spam 等）の同期 — `mail.folders` テーブル新設、`client.list()` でフォルダ一覧取得、各フォルダごとに差分同期ループ、`messages.folder_id` 追加、UI にフォルダ切替サイドバー
 - `mail.message_reads` に UPDATE ポリシー追加（現在は insert + ignoreDuplicates で回避中）
 
+### 添付ファイル対応（未実装）
+
+**現状**:
+- スキーマ: `mail.attachments` テーブルは存在（`filename`, `content_type`, `size_bytes`, `storage_path`, `content_id`）
+- 検知: `has_attachments` フラグは `imap-sync` で正しくセット済み
+- 保存: **未実装**（`parsed.attachments[]` は取得されているがループ内で捨てている）
+- UI: **未実装**（メッセージ表示は `body_text` の `<pre>` のみ）
+
+**実装手順**:
+
+1. **Supabase Storage バケット作成**（手動）
+   - バケット名: `mail-attachments`
+   - Public: false（署名付き URL で配信）
+   - RLS: `has_account_access(account_id)` ベースで読み取り許可
+
+2. **`imap-sync` で添付アップロード**（`supabase/functions/imap-sync/index.ts`）
+   - `parsed.attachments[]` をループして Storage へ upload
+   - パス: `{account_id}/{message_id}/{random}-{filename}` （同名対策で UUID 前置）
+   - `mail.attachments` へ insert: `filename`, `content_type`, `size_bytes`, `storage_path`, `content_id`
+   - インライン画像（`content_id` あり）は `body_html` の `cid:xxx` を Storage URL に差し替える前処理も検討
+   - サイズ上限（例: 25MB）を超えるものはスキップ+ログ警告
+   - エラー時はメッセージ本体の upsert は成功させる（添付保存失敗でメール取得全体を失敗させない）
+
+3. **送信時の添付対応**（`supabase/functions/send-mail/index.ts` および `compose/+page.svelte`）
+   - Compose 画面にファイル選択 input 追加
+   - Storage の tmp パス（`tmp/{user_id}/{random}-{filename}`）にアップロード
+   - `mail_drafts` に `attachments JSONB`（storage_path の配列）を追加
+   - 送信時に nodemailer の `attachments` オプションに渡す
+   - 送信成功後は tmp パスから正式パスへ move
+
+4. **UI で添付表示**（`src/routes/+page.svelte`）
+   - メッセージ詳細に添付リストを表示（ファイル名・サイズ・アイコン）
+   - クリックで署名付き URL を取得してダウンロード
+   - 画像はインラインプレビュー（`body_html` 内の `cid:` 参照も展開）
+
+**優先度**: PoC の業務利用では **添付を見られる**ほうが先。送信時の添付は後回しで OK。
+
+**注意**:
+- Storage の容量上限に注意（Supabase Free は 1GB、Pro は 100GB）
+- 自動削除ポリシーが必要になる可能性（古いメールの添付を定期的に削除）
+- ウイルススキャンは PoC では入れない
+
 ## アーキテクチャ状態
 
 - フロント: SvelteKit + Svelte 5 runes、Cloudflare Pages (dev / main 2 ブランチ運用だが main 未作成)
