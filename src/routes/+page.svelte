@@ -802,33 +802,36 @@
   //   (2) マウス左クリック+ドラッグ       — Pointer Events
   //   (3) Mac トラックパッド 2 本指スワイプ — wheel Events (クリック不要)
   //
-  // 共通フロー: 左方向の累積量が threshold (-100px) を超えたら card を
-  // -110% までスライドアウトさせて onSwipe を発火。
+  // 左方向の累積量が閾値を超えたら card を -110% までスライドアウトさせて
+  // onSwipe を発火。pointer は指/マウスで簡単に長く引けるため threshold (-300px)
+  // を、wheel は trackpad 2 本指で累積 deltaX がそこまで伸びないため
+  // wheelThreshold (既定で threshold の半分 = -150px) を使う。
   function swipeable(
     node: HTMLElement,
-    params: { threshold: number; onSwipe: () => void },
+    params: { threshold: number; wheelThreshold?: number; onSwipe: () => void },
   ) {
     let startX = 0, startY = 0;
     let active = false, decided = false, horizontal = false;
     let pid: number | null = null;
     let suppressClick = false;
     const threshold = params.threshold;
+    const wheelThreshold = params.wheelThreshold ?? Math.round(threshold / 2);
 
     const bgEl = (): HTMLElement | null =>
       node.parentElement?.querySelector(".swipe-bg") ?? null;
 
-    const updateVisual = (off: number) => {
+    const updateVisual = (off: number, t: number = threshold) => {
       node.style.transform = `translateX(${off}px)`;
       const bg = bgEl();
       if (bg) {
-        const ratio = Math.min(1, Math.abs(off) / Math.abs(threshold));
+        const ratio = Math.min(1, Math.abs(off) / Math.abs(t));
         bg.style.opacity = String(0.25 + ratio * 0.75);
       }
     };
-    const finalize = (off: number) => {
+    const finalize = (off: number, t: number = threshold) => {
       node.style.transition = "transform 200ms ease-out";
       const bg = bgEl();
-      if (off <= threshold) {
+      if (off <= t) {
         node.style.transform = "translateX(-110%)";
         setTimeout(() => params.onSwipe(), 180);
       } else {
@@ -896,7 +899,7 @@
       wheelTimer = null;
       const off = -wheelAccum;
       wheelAccum = 0;
-      finalize(off);
+      finalize(off, wheelThreshold);
     };
     const onWheel = (e: WheelEvent) => {
       // 垂直優位の wheel (普通の縦スクロール) は一切触らない
@@ -910,7 +913,7 @@
       e.preventDefault();
       node.style.transition = "none";
       wheelAccum += e.deltaX;
-      updateVisual(-wheelAccum);
+      updateVisual(-wheelAccum, wheelThreshold);
       if (wheelTimer) clearTimeout(wheelTimer);
       wheelTimer = setTimeout(wheelFinalize, 120);
     };
