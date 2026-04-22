@@ -73,9 +73,9 @@ Deno.serve(async (req) => {
     // service_role では auth.uid() が効かないので明示チェック
     const { data: acc } = await sb
       .from("accounts")
-      .select("owner_id,is_shared")
+      .select("owner_id,is_shared,default_tone")
       .eq("id", target.account_id)
-      .single();
+      .single<{ owner_id: string; is_shared: boolean; default_tone?: string }>();
     if (!acc) throw new Error("account not found");
 
     let allowed = acc.owner_id === userId;
@@ -116,9 +116,14 @@ Deno.serve(async (req) => {
       })
       .join("\n\n");
 
+    // hint が明示指定されていればそれを優先、無ければアカウントの default_tone を使う
+    const effectiveHint = (hint && String(hint).trim().length > 0)
+      ? String(hint)
+      : (acc.default_tone && acc.default_tone.trim().length > 0 ? acc.default_tone : "");
+
     const userPrompt = [
       "以下のメールスレッドに対して、最新メッセージへの返信下書きを作成してください。",
-      hint ? `\n【ユーザーからの指示】\n${hint}` : "",
+      effectiveHint ? `\n【トーン・スタイル指示】\n${effectiveHint}` : "",
       "\n【スレッド履歴 (古い順)】\n",
       contextLines,
       "\n\n【返信対象 (最新)】\n",
@@ -163,7 +168,7 @@ Deno.serve(async (req) => {
         subject: parsed.subject,
         body_text: parsed.body_text,
         generated_by_ai: true,
-        ai_prompt_hint: hint ?? null,
+        ai_prompt_hint: effectiveHint || null,
         status: "draft",
       })
       .select("id,subject,body_text")

@@ -6,6 +6,16 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.6.0",
+    date: "2026-04-22",
+    changes: [
+      "アプリ名を「TASKUL Mail」に変更 (ヘッダー・タイトル・ログイン画面)",
+      "Claude 返信トーンをアカウントごとの既定値として mail.accounts.default_tone に保存するよう変更。アカウント追加フォーム・編集モーダルから設定可能",
+      "返信コンポーズ画面からトーン入力欄を撤去。✨ 再生成ボタンはアカウントの default_tone を自動で使う",
+      "generate-draft Edge Function: リクエストの hint 指定が無いときはアカウントの default_tone にフォールバック",
+    ],
+  },
+  {
     version: "0.5.2",
     date: "2026-04-22",
     changes: [

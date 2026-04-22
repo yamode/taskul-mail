@@ -51,7 +51,6 @@
   let compose = $state<Compose | null>(null);
   let generating = $state(false);
   let sending = $state(false);
-  let hint = $state("");
   let userId = $state<string | null>(null);
   let hoverThreadId = $state<string | null>(null);
 
@@ -533,7 +532,7 @@
       const res = await fetch(fnUrl("generate-draft"), {
         method: "POST",
         headers: { "content-type": "application/json", ...(await authHeader()) },
-        body: JSON.stringify({ message_id: selectedMessageId, hint: hint || undefined }),
+        body: JSON.stringify({ message_id: selectedMessageId }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "failed");
@@ -766,29 +765,19 @@
           <span class="compose-mode">
             {compose.mode === "reply" ? "↩ 返信を作成" : "→ 転送を作成"}
           </span>
+          <button
+            class="ai"
+            onclick={generateDraft}
+            disabled={generating || compose.mode !== "reply"}
+            title="アカウント設定のトーンで Claude 再生成"
+          >
+            {generating ? "生成中…" : "✨ 再生成"}
+          </button>
           <span class="spacer"></span>
           <button class="ghost" onclick={cancelCompose} title="下書きを破棄">破棄</button>
           <button class="ghost" onclick={saveCompose} title="下書きとして保存">下書き保存</button>
           <button class="primary" onclick={sendCompose} disabled={sending}>
             {sending ? "送信中…" : "▶ 送信"}
-          </button>
-        </div>
-        <div class="compose-header-row tone-row">
-          <label class="tone-inline">
-            <span>Claude トーン</span>
-            <input
-              type="text"
-              placeholder="例: 丁寧に、簡潔に、提案を含めて (空欄可)"
-              bind:value={hint}
-            />
-          </label>
-          <button
-            class="ai"
-            onclick={generateDraft}
-            disabled={generating || compose.mode !== "reply"}
-            title="Claude で再生成"
-          >
-            {generating ? "生成中…" : "✨ 再生成"}
           </button>
         </div>
       </header>
@@ -1155,30 +1144,6 @@
   .compose-header .ai:hover:not(:disabled) { background: #e0e7ff; }
   .compose-header .ai:disabled { opacity: 0.5; cursor: not-allowed; }
 
-  .tone-row { background: #f9fafb; border-radius: 4px; padding: 0.3rem 0.5rem; }
-  .tone-inline {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex: 1;
-    min-width: 0;
-  }
-  .tone-inline > span {
-    font-size: 0.78rem;
-    color: #6b7280;
-    white-space: nowrap;
-  }
-  .tone-inline > input {
-    flex: 1;
-    min-width: 0;
-    border: 1px solid #e5e7eb;
-    background: #fff;
-    border-radius: 4px;
-    padding: 0.3rem 0.5rem;
-    font-size: 0.85rem;
-    font-family: inherit;
-  }
-  .tone-inline > input:focus { outline: 2px solid #bfdbfe; border-color: #60a5fa; }
 
   .compose {
     padding: 1rem 1.25rem 2rem;

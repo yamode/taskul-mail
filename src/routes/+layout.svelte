@@ -27,7 +27,7 @@
 </script>
 
 <svelte:head>
-  <title>tasukul mail</title>
+  <title>TASKUL Mail</title>
 </svelte:head>
 
 <main>
@@ -35,14 +35,14 @@
     <p>読み込み中...</p>
   {:else if !session}
     <section class="auth">
-      <h1>tasukul mail</h1>
+      <h1>TASKUL Mail</h1>
       <input type="email" placeholder="email" bind:value={email} />
       <input type="password" placeholder="password" bind:value={password} />
       <button onclick={signIn}>ログイン</button>
     </section>
   {:else}
     <header>
-      <strong>tasukul mail</strong>
+      <strong>TASKUL Mail</strong>
       <button class="header-version" onclick={() => (showReleaseNotes = true)}>
         v{version}
       </button>

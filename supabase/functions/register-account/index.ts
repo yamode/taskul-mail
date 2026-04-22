@@ -34,6 +34,7 @@ Deno.serve(async (req) => {
       imap_port = 993,
       smtp_host = "smtp.xserver.jp",
       smtp_port = 465,
+      default_tone = "",
     } = body;
 
     if (!label || !email_address || !password) {
@@ -60,6 +61,7 @@ Deno.serve(async (req) => {
         smtp_port,
         password_secret_id: secretId,
         is_shared,
+        default_tone,
       })
       .select("id")
       .single();

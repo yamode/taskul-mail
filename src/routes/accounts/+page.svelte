@@ -13,6 +13,7 @@
     smtp_host: string;
     smtp_port: number;
     username: string;
+    default_tone?: string;
   };
 
   let accounts = $state<Account[]>([]);
@@ -20,6 +21,7 @@
   let emailAddress = $state("");
   let password = $state("");
   let isShared = $state(false);
+  let defaultTone = $state("");
   let saving = $state(false);
   let showAdvanced = $state(false);
   let imapHost = $state("imap.xserver.jp");
@@ -32,6 +34,7 @@
     emailAddress = "";
     password = "";
     isShared = false;
+    defaultTone = "";
     showAdvanced = false;
     imapHost = "imap.xserver.jp";
     imapPort = 993;
@@ -42,12 +45,23 @@
   onMount(loadAccounts);
 
   async function loadAccounts() {
-    const { data } = await mail
+    // default_tone カラムが未適用の環境でも落ちないようフォールバック
+    const { data, error } = await mail
       .from("accounts")
       .select(
-        "id,label,email_address,is_shared,last_synced_at,imap_host,imap_port,smtp_host,smtp_port,username",
+        "id,label,email_address,is_shared,last_synced_at,imap_host,imap_port,smtp_host,smtp_port,username,default_tone",
       )
       .order("created_at");
+    if (error && /default_tone/.test(error.message ?? "")) {
+      const { data: data2 } = await mail
+        .from("accounts")
+        .select(
+          "id,label,email_address,is_shared,last_synced_at,imap_host,imap_port,smtp_host,smtp_port,username",
+        )
+        .order("created_at");
+      accounts = (data2 ?? []) as Account[];
+      return;
+    }
     accounts = (data ?? []) as Account[];
   }
 
@@ -80,6 +94,7 @@
           smtp_host: editing.smtp_host,
           smtp_port: Number(editing.smtp_port),
           is_shared: editing.is_shared,
+          default_tone: editing.default_tone ?? "",
         })
         .eq("id", editing.id);
       if (uErr) throw uErr;
@@ -116,6 +131,7 @@
           imap_port: Number(imapPort),
           smtp_host: smtpHost,
           smtp_port: Number(smtpPort),
+          default_tone: defaultTone,
         },
       });
       if (error) throw error;
@@ -181,6 +197,12 @@
     <label class="checkbox">
       <input type="checkbox" bind:checked={isShared} />
       共有アカウント (チーム全員で閲覧)
+    </label>
+    <label class="field">Claude 返信トーン (このアカウントで返信生成する際の既定指示)
+      <input
+        placeholder="例: 丁寧・簡潔に、宿の担当者として / 空欄なら汎用トーン"
+        bind:value={defaultTone}
+      />
     </label>
 
     <button type="button" class="toggle" onclick={() => (showAdvanced = !showAdvanced)}>
@@ -257,6 +279,14 @@
         <input type="checkbox" bind:checked={editing.is_shared} />
         共有アカウント
       </label>
+      <label class="field">Claude 返信トーン (このアカウントで返信生成する際の既定指示)
+        <textarea
+          rows="2"
+          placeholder="例: 丁寧・簡潔に、宿の担当者として / 空欄なら汎用トーン"
+          value={editing.default_tone ?? ""}
+          oninput={(e) => (editing!.default_tone = (e.target as HTMLTextAreaElement).value)}
+        ></textarea>
+      </label>
       <div class="modal-actions">
         <button onclick={closeEdit}>キャンセル</button>
         <button class="primary" onclick={saveEdit} disabled={editSaving}>
@@ -320,9 +350,10 @@
     max-height: 90vh; overflow-y: auto;
   }
   .modal h3 { margin: 0 0 0.5rem 0; }
-  .modal input {
+  .modal input, .modal textarea {
     padding: 0.4rem 0.5rem; border: 1px solid #d1d5db; border-radius: 4px;
     font-size: 0.95rem;
+    font-family: inherit;
   }
   .modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.5rem; }
   .modal-actions button { padding: 0.5rem 1rem; border: 1px solid #d1d5db; border-radius: 4px; background: #f9fafb; cursor: pointer; }
