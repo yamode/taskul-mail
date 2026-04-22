@@ -3,6 +3,8 @@
   import ReleaseNotesModal from "$lib/components/ReleaseNotesModal.svelte";
   import { version } from "../../package.json";
   import { onMount } from "svelte";
+  import { page } from "$app/stores";
+  import { goto } from "$app/navigation";
 
   let { children } = $props();
   let session = $state<any>(null);
@@ -10,6 +12,26 @@
   let email = $state("");
   let password = $state("");
   let showReleaseNotes = $state(false);
+  let searchInput = $state("");
+
+  // URL の ?q= を入力欄へ反映 (ブラウザバック等で同期)
+  $effect(() => {
+    const q = $page.url.searchParams.get("q") ?? "";
+    if (q !== searchInput && $page.url.pathname === "/") searchInput = q;
+  });
+
+  function onSearchInput(value: string) {
+    searchInput = value;
+    if ($page.url.pathname !== "/") {
+      // 検索は受信トレイ画面のみ対象
+      void goto(value ? `/?q=${encodeURIComponent(value)}` : "/", { keepFocus: true, replaceState: true });
+      return;
+    }
+    const url = new URL($page.url);
+    if (value) url.searchParams.set("q", value);
+    else url.searchParams.delete("q");
+    void goto(url.pathname + url.search, { keepFocus: true, replaceState: true, noScroll: true });
+  }
 
   onMount(async () => {
     const { data } = await supabase.auth.getSession();
@@ -51,6 +73,13 @@
         <a href="/accounts">アカウント</a>
         <a href="/ai-settings">AI 設定</a>
       </nav>
+      <input
+        class="header-search"
+        type="search"
+        placeholder="🔍 件名・差出人で検索"
+        value={searchInput}
+        oninput={(e) => onSearchInput((e.currentTarget as HTMLInputElement).value)}
+      />
       <span>{session.user.email}</span>
       <button onclick={signOut}>ログアウト</button>
     </header>
@@ -102,6 +131,15 @@
   }
   header nav a:hover { background: #f3f4f6; }
   header span { flex: 1; color: #666; font-size: 0.9rem; text-align: right; }
+  .header-search {
+    padding: 0.3rem 0.6rem;
+    font-size: 0.85rem;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    width: 260px;
+    background: #f9fafb;
+  }
+  .header-search:focus { outline: none; border-color: #2563eb; background: #fff; }
   .auth {
     max-width: 320px;
     margin: 5rem auto;

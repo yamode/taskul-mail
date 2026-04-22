@@ -432,6 +432,36 @@ async function syncOneAccount(
       }
 
       console.log(`[${account.email_address}] thread resolved uid=${msg.uid}`);
+
+      // 本文補完: body_text / body_html のどちらかが欠落していても表示できるようにする。
+      // - text のみ空 → parsed.textAsHtml or html から推定
+      // - 両方空 → 添付情報を snippet 的に入れる
+      let finalText: string | null = parsed.text ?? null;
+      let finalHtml: string | null = parsed.html || null;
+      if (!finalText && finalHtml) {
+        // HTML しかない場合でも text mode で何か出せるように簡易 strip
+        finalText = String(finalHtml)
+          .replace(/<style[\s\S]*?<\/style>/gi, "")
+          .replace(/<script[\s\S]*?<\/script>/gi, "")
+          .replace(/<br\s*\/?>/gi, "\n")
+          .replace(/<\/p>/gi, "\n\n")
+          .replace(/<[^>]+>/g, "")
+          .replace(/&nbsp;/g, " ")
+          .replace(/&amp;/g, "&")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&quot;/g, '"')
+          .trim();
+      }
+      if (!finalText && !finalHtml) {
+        const attNames = Array.isArray(parsed.attachments)
+          ? parsed.attachments.map((a: { filename?: string }) => a.filename).filter(Boolean).join(", ")
+          : "";
+        if (attNames) {
+          finalText = `(本文なし — 添付のみ: ${attNames})`;
+        }
+      }
+
       // メッセージ insert (重複は account_id+imap_uid の unique で弾く)
       const { data: upsertedMsg, error: mErr } = await sb.from("messages").upsert(
         {
@@ -446,9 +476,9 @@ async function syncOneAccount(
           to_addresses: toAddrs,
           cc_addresses: ccAddrs,
           subject: parsed.subject ?? null,
-          body_text: parsed.text ?? null,
-          body_html: parsed.html || null,
-          snippet: snippetOf(parsed.text),
+          body_text: finalText,
+          body_html: finalHtml,
+          snippet: snippetOf(finalText ?? undefined),
           received_at: (parsed.date ?? new Date()).toISOString(),
           has_attachments: (parsed.attachments?.length ?? 0) > 0,
           direction: "inbound",

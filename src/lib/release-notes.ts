@@ -6,6 +6,16 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.14.0",
+    date: "2026-04-23",
+    changes: [
+      "メインメニューに検索バー追加 (件名・差出人・参加者を対象に部分一致フィルタ)。?q= 付き URL で状態を共有可能",
+      "メール一覧に 📎 添付バッジを表示。スレッド内のいずれかのメッセージに添付があれば件名横にアイコンが出る",
+      "メール本文が空だった時のフォールバックを強化: body_text / body_html どちらも無い場合は「本文を取得できませんでした」パネル + 再取得ボタンを表示。同期側でも HTML→text 簡易変換 / 添付のみメールのプレースホルダー生成を追加",
+      "削除の IMAP サーバ同期: 5 秒の undo 猶予を過ぎたら imap-trash Edge Function で Trash フォルダへ MOVE (COPY+STORE+EXPUNGE フォールバック)。他のメーラや Webmail でも削除状態が揃う",
+    ],
+  },
+  {
     version: "0.11.0",
     date: "2026-04-22",
     changes: [

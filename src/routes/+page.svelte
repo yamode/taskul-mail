@@ -2,6 +2,7 @@
   import { supabase, mail, fnUrl, authHeader } from "$lib/supabase";
   import { onMount, onDestroy } from "svelte";
   import MailHtmlView from "$lib/components/MailHtmlView.svelte";
+  import { page } from "$app/stores";
 
   type Thread = {
     id: string;
@@ -15,6 +16,7 @@
     unread_count?: number;
     last_from_name?: string | null;
     last_from_address?: string | null;
+    has_attachments?: boolean;
   };
   type Attachment = {
     id: string;
@@ -91,6 +93,14 @@
     return !!m.body_text && m.body_text.startsWith("[本文取得失敗");
   }
 
+  // body_html / body_text のどちらも実体がない状態。
+  // (mailparser が multipart/alternative + 添付のみのメールで空を返すケース等)
+  function bodyIsEmpty(m: Message): boolean {
+    const t = (m.body_text ?? "").trim();
+    const h = (m.body_html ?? "").trim();
+    return !t && !h;
+  }
+
   async function refetchMessageBody(m: Message) {
     if (!m.account_id || m.imap_uid == null) {
       alert("再取得に必要な情報 (account_id / imap_uid) が欠けています");
@@ -131,11 +141,24 @@
     return arr;
   });
 
-  let filtered = $derived(
-    filterAccountId
+  // メインメニュー検索: ?q= を件名・差出人・参加者に対して部分一致 (大文字小文字無視)
+  let searchQuery = $derived(($page.url.searchParams.get("q") ?? "").trim().toLowerCase());
+
+  let filtered = $derived.by(() => {
+    const base = filterAccountId
       ? threads.filter((t) => t.account_id === filterAccountId)
-      : [],
-  );
+      : [];
+    if (!searchQuery) return base;
+    return base.filter((t) => {
+      const hay = [
+        t.subject_normalized,
+        t.last_from_name,
+        t.last_from_address,
+        ...(t.participants ?? []),
+      ].filter(Boolean).join(" ").toLowerCase();
+      return hay.includes(searchQuery);
+    });
+  });
 
   // 同期状態: アカウントごとに独立管理する。
   // 1 つの遅い/ハングしたアカウントが他のアカウントの反映を待たせないようにする。
@@ -688,16 +711,18 @@
       const threadIds = base.map((t) => t.id);
       const { data: threadMsgs } = await mail
         .from("messages")
-        .select("id,thread_id,from_name,from_address,received_at")
+        .select("id,thread_id,from_name,from_address,received_at,has_attachments")
         .in("thread_id", threadIds)
         .order("received_at", { ascending: false });
       const msgToThread = new Map<string, string>();
       const latestByThread = new Map<string, { from_name: string | null; from_address: string | null }>();
+      const hasAttByThread = new Set<string>();
       for (const m of (threadMsgs ?? []) as any[]) {
         msgToThread.set(m.id, m.thread_id);
         if (!latestByThread.has(m.thread_id)) {
           latestByThread.set(m.thread_id, { from_name: m.from_name, from_address: m.from_address });
         }
+        if (m.has_attachments) hasAttByThread.add(m.thread_id);
       }
       for (const t of base) {
         const l = latestByThread.get(t.id);
@@ -705,6 +730,7 @@
           t.last_from_name = l.from_name;
           t.last_from_address = l.from_address;
         }
+        t.has_attachments = hasAttByThread.has(t.id);
       }
       if (msgToThread.size > 0) {
         const { data: cmts } = await mail
@@ -994,9 +1020,31 @@
     recentlyDeletedIds = [...recentlyDeletedIds, id];
     if (undoToastTimer) clearTimeout(undoToastTimer);
     undoToastTimer = setTimeout(() => {
+      const toCommit = recentlyDeletedIds;
       recentlyDeletedIds = [];
       undoToastTimer = null;
+      // 5 秒の undo 猶予を越えたら IMAP サーバ側でも Trash へ MOVE する。
+      // ここで失敗しても DB の trashed_at は立っているので UI 上は一貫。
+      if (toCommit.length > 0) void commitImapTrash(toCommit);
     }, UNDO_WINDOW_MS);
+  }
+
+  async function commitImapTrash(threadIds: string[]) {
+    try {
+      const res = await fetch(fnUrl("imap-trash"), {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(await authHeader()) },
+        body: JSON.stringify({ thread_ids: threadIds }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        console.error("imap-trash failed", res.status, detail);
+        hint = `IMAP 側の削除に失敗しました (${res.status})`;
+      }
+    } catch (e) {
+      console.error("imap-trash error", e);
+      hint = `IMAP 側の削除に失敗しました: ${(e as Error).message}`;
+    }
   }
 
   async function undoRecentDeletes() {
@@ -1706,6 +1754,9 @@
                   💬 {commentCountByThread[t.id]}
                 </span>
               {/if}
+              {#if t.has_attachments}
+                <span class="att-badge" title="添付ファイルあり">📎</span>
+              {/if}
               {t.subject_normalized || "(件名なし)"}
             </div>
             <div class="participants">{t.participants.slice(0, 2).join(", ")}</div>
@@ -2021,15 +2072,15 @@
           </header>
           <h3>{m.subject ?? ""}</h3>
 
-          {#if bodyIsPlaceholder(m)}
-            <!-- envelope-only フォールバックのプレースホルダー。手動再取得できるようにする -->
+          {#if bodyIsPlaceholder(m) || bodyIsEmpty(m)}
+            <!-- envelope-only プレースホルダー or 本文が空のメッセージ。手動再取得できるようにする -->
             <div
               class="body-placeholder"
               role="presentation"
               onclick={(e) => e.stopPropagation()}
               onkeydown={(e) => e.stopPropagation()}
             >
-              <p>{m.body_text}</p>
+              <p>{bodyIsPlaceholder(m) ? m.body_text : "(本文を取得できませんでした。添付のみ、または IMAP パース失敗の可能性があります)"}</p>
               <button
                 class="refetch-btn"
                 disabled={refetchingByMessage[m.id] || m.imap_uid == null}
@@ -3077,6 +3128,13 @@
     border-radius: 999px;
     font-size: 0.72rem;
     font-weight: 600;
+    vertical-align: middle;
+  }
+  .att-badge {
+    display: inline-block;
+    margin-right: 0.35rem;
+    font-size: 0.85rem;
+    color: #6b7280;
     vertical-align: middle;
   }
   .comments-head {

@@ -136,3 +136,154 @@ export async function fetchSourceRawImap(opts: RawFetchOptions): Promise<Uint8Ar
     try { conn.close(); } catch { /* ignore */ }
   }
 }
+
+export type TrashOptions = {
+  host: string;
+  port: number;
+  user: string;
+  pass: string;
+  uids: number[];
+  mailbox?: string;
+  /** 明示的な Trash フォルダ名 (未指定なら LIST で自動検出 → 一般的な名前で推定) */
+  trashMailbox?: string;
+  timeoutMs?: number;
+};
+
+export type TrashResult = {
+  trashMailbox: string;
+  moved: number[];
+  method: "move" | "copy-expunge";
+};
+
+/** 生 IMAP で複数 UID を Trash フォルダへ移動する (RFC 6851 MOVE 優先、未対応なら COPY+STORE+EXPUNGE)。 */
+export async function moveToTrashRawImap(opts: TrashOptions): Promise<TrashResult> {
+  const mailbox = opts.mailbox ?? "INBOX";
+  const timeout = opts.timeoutMs ?? 45_000;
+  if (opts.uids.length === 0) {
+    return { trashMailbox: opts.trashMailbox ?? "Trash", moved: [], method: "move" };
+  }
+
+  const conn = await Deno.connectTls({ hostname: opts.host, port: opts.port });
+  const reader = new IMAPReader(conn);
+  const enc = new TextEncoder();
+  const write = async (s: string) => { await conn.write(enc.encode(s)); };
+
+  let seq = 0;
+  const nextTag = () => `a${++seq}`;
+
+  /** untagged レスポンス行 (buffered) を含め、指定 tag の最終応答まで読み進める。 */
+  const readUntilTagged = async (tag: string): Promise<{ lines: string[]; final: string }> => {
+    const lines: string[] = [];
+    while (true) {
+      const line = await reader.readLine();
+      if (line.startsWith(tag + " ")) return { lines, final: line };
+      // literal が来たら読み飛ばす
+      const m = line.match(/\{(\d+)\}\r?\n$/);
+      if (m) {
+        const size = parseInt(m[1], 10);
+        await reader.readBytes(size);
+        await reader.readLine();
+        continue;
+      }
+      lines.push(line);
+    }
+  };
+
+  const run = async (): Promise<TrashResult> => {
+    // greeting
+    await reader.readLine();
+
+    // AUTH
+    const payload = btoa(`\u0000${opts.user}\u0000${opts.pass}`);
+    const authTag = nextTag();
+    await write(`${authTag} AUTHENTICATE PLAIN ${payload}\r\n`);
+    const auth = await readUntilTagged(authTag);
+    if (!/OK/i.test(auth.final.split(" ")[1] ?? "")) {
+      throw new Error(`raw-imap auth failed: ${auth.final.trim()}`);
+    }
+
+    // CAPABILITY
+    const capTag = nextTag();
+    await write(`${capTag} CAPABILITY\r\n`);
+    const cap = await readUntilTagged(capTag);
+    const caps = cap.lines.join(" ").toUpperCase();
+    const hasMove = /\sMOVE\b/.test(caps);
+
+    // Trash フォルダを決定 (明示指定 > SPECIAL-USE > 名前推定)
+    let trashName = opts.trashMailbox ?? "";
+    if (!trashName) {
+      const listTag = nextTag();
+      await write(`${listTag} LIST "" "*"\r\n`);
+      const list = await readUntilTagged(listTag);
+      // * LIST (\HasNoChildren \Trash) "/" "INBOX.Trash"
+      for (const line of list.lines) {
+        if (/\\Trash/i.test(line)) {
+          const m = line.match(/"([^"]+)"\s*$/) || line.match(/\s(\S+)\s*\r?\n?$/);
+          if (m) { trashName = m[1]; break; }
+        }
+      }
+      if (!trashName) {
+        // 名前推定フォールバック
+        const lower = list.lines.map((l) => l.toLowerCase()).join("\n");
+        const candidates = ["INBOX.Trash", "Trash", "ゴミ箱", "Deleted Messages", "Deleted Items"];
+        for (const c of candidates) {
+          if (lower.includes(c.toLowerCase())) { trashName = c; break; }
+        }
+      }
+      if (!trashName) trashName = "Trash";
+    }
+
+    // SELECT INBOX (read-write)
+    const selTag = nextTag();
+    await write(`${selTag} SELECT ${mailbox}\r\n`);
+    const sel = await readUntilTagged(selTag);
+    if (!/OK/i.test(sel.final.split(" ")[1] ?? "")) {
+      throw new Error(`raw-imap select failed: ${sel.final.trim()}`);
+    }
+
+    const uidSet = opts.uids.join(",");
+    let method: "move" | "copy-expunge";
+
+    if (hasMove) {
+      const mvTag = nextTag();
+      await write(`${mvTag} UID MOVE ${uidSet} "${trashName}"\r\n`);
+      const mv = await readUntilTagged(mvTag);
+      if (!/OK/i.test(mv.final.split(" ")[1] ?? "")) {
+        throw new Error(`raw-imap UID MOVE failed: ${mv.final.trim()}`);
+      }
+      method = "move";
+    } else {
+      // COPY → STORE \Deleted → EXPUNGE
+      const cpTag = nextTag();
+      await write(`${cpTag} UID COPY ${uidSet} "${trashName}"\r\n`);
+      const cp = await readUntilTagged(cpTag);
+      if (!/OK/i.test(cp.final.split(" ")[1] ?? "")) {
+        throw new Error(`raw-imap UID COPY failed: ${cp.final.trim()}`);
+      }
+      const stTag = nextTag();
+      await write(`${stTag} UID STORE ${uidSet} +FLAGS.SILENT (\\Deleted)\r\n`);
+      const st = await readUntilTagged(stTag);
+      if (!/OK/i.test(st.final.split(" ")[1] ?? "")) {
+        throw new Error(`raw-imap UID STORE failed: ${st.final.trim()}`);
+      }
+      const exTag = nextTag();
+      await write(`${exTag} EXPUNGE\r\n`);
+      const ex = await readUntilTagged(exTag);
+      if (!/OK/i.test(ex.final.split(" ")[1] ?? "")) {
+        throw new Error(`raw-imap EXPUNGE failed: ${ex.final.trim()}`);
+      }
+      method = "copy-expunge";
+    }
+
+    // LOGOUT (best-effort)
+    try { await write(`${nextTag()} LOGOUT\r\n`); } catch { /* ignore */ }
+
+    return { trashMailbox: trashName, moved: opts.uids, method };
+  };
+
+  try {
+    return await withTimeout(run(), timeout, `raw-imap trash timeout`);
+  } finally {
+    try { conn.close(); } catch { /* ignore */ }
+  }
+}
