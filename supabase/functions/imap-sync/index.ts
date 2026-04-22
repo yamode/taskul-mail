@@ -175,56 +175,69 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
 
     // 同期モード判定:
     // - first: まだ何も同期していない → sequence 末尾から N 件
-    // - forward: 新着あり → UID の forward 範囲
-    // - backfill: 過去メール未取得 → SEARCH で UID 列挙 → 新しい順 N 件だけ fetch
-    //   (大きな範囲を fetch すると imapflow の iterator がハングするため
-    //    対象 UID を SEARCH で絞ってからピンポイント fetch する)
+    // - forward: 新着あり → SEARCH で UID 列挙
+    // - backfill: 過去メール未取得 → SEARCH で UID 列挙 (新しい順先頭 N 件)
     // - idle: 同期済み
+    //
+    // 全モードで「対象 UID リストを先に確定 → fetchOne で 1 件ずつ取得」方式にする。
+    // 以前の range fetch (例: 182601:182680) は imapflow の iterator が
+    // 1 件目 upsert 後に次の FETCH 応答を待って永久停止するサーバ挙動で詰まるため。
     let mode: "first" | "forward" | "backfill" | "idle";
-    let fetchRange: string | null = null;
-    let isSeqRange = false;
-    let backfillUids: number[] = [];
+    let targetUids: number[] = [];
+    let firstSyncRange: string | null = null; // seq レンジ (first モード時のみ)
 
     if (effectiveLastUid === 0 && oldestSyncedUid === null) {
       mode = "first";
-      fetchRange = exists > 0
+      firstSyncRange = exists > 0
         ? `${Math.max(1, exists - MAX_PER_RUN + 1)}:${exists}`
         : null;
-      isSeqRange = true;
     } else if (actualMaxUid > effectiveLastUid) {
       mode = "forward";
-      fetchRange = `${effectiveLastUid + 1}:${actualMaxUid}`;
-      isSeqRange = false;
+      console.log(`[${account.email_address}] FORWARD search ${effectiveLastUid + 1}:${actualMaxUid}`);
+      const r = await client.search(
+        { uid: `${effectiveLastUid + 1}:${actualMaxUid}` },
+        { uid: true },
+      );
+      const uids = (r ?? []).map((u: unknown) => Number(u)).filter((n) => !isNaN(n));
+      uids.sort((a, b) => a - b); // 古い順で順に上書きしやすく
+      targetUids = uids.slice(0, MAX_PER_RUN);
     } else if (oldestSyncedUid !== null && oldestSyncedUid > 1) {
       mode = "backfill";
-      const searchResult = await client.search(
+      console.log(`[${account.email_address}] BACKFILL search 1:${oldestSyncedUid - 1}`);
+      const r = await client.search(
         { uid: `1:${oldestSyncedUid - 1}` },
         { uid: true },
       );
-      // search は UID の配列を返す。新しい順に並べ替えて先頭 N 件を取得対象に。
-      const allUids = (searchResult ?? []).map((u: unknown) => Number(u)).filter((n) => !isNaN(n));
-      allUids.sort((a, b) => b - a);
-      backfillUids = allUids.slice(0, MAX_PER_RUN);
-      fetchRange = backfillUids.length > 0 ? backfillUids.join(",") : null;
-      isSeqRange = false;
+      const uids = (r ?? []).map((u: unknown) => Number(u)).filter((n) => !isNaN(n));
+      uids.sort((a, b) => b - a); // 新しい順
+      targetUids = uids.slice(0, MAX_PER_RUN);
     } else {
       mode = "idle";
     }
     diag.mode = mode;
-    diag.fetch_range = fetchRange;
-    diag.backfill_total_uids = mode === "backfill" ? backfillUids.length : undefined;
+    diag.target_uid_count = targetUids.length;
     const isFirstSync = mode === "first";
 
-    const fetchIter = fetchRange
+    // first モードのみ range fetch、他は UID リストベースで fetchOne ループ
+    const fetchIter = (isFirstSync && firstSyncRange)
       ? client.fetch(
-          fetchRange,
+          firstSyncRange,
           { uid: true, envelope: true, source: true, internalDate: true },
-          { uid: !isSeqRange },
+          { uid: false },
         )
-      : (async function* () {})();
-    const shouldFetch = fetchRange !== null;
+      : (async function* () {
+          for (const uid of targetUids) {
+            const one = await client.fetchOne(
+              String(uid),
+              { uid: true, envelope: true, source: true, internalDate: true },
+              { uid: true },
+            );
+            if (one) yield one as never;
+          }
+        })();
+    const shouldFetch = isFirstSync ? !!firstSyncRange : targetUids.length > 0;
 
-    console.log(`[${account.email_address}] START mode=${mode} fetchRange=${fetchRange} exists=${exists} lastUid=${effectiveLastUid} actualMaxUid=${actualMaxUid} oldestSyncedUid=${oldestSyncedUid}`);
+    console.log(`[${account.email_address}] START mode=${mode} targetUids=${targetUids.length} firstSyncRange=${firstSyncRange} exists=${exists} lastUid=${effectiveLastUid} actualMaxUid=${actualMaxUid} oldestSyncedUid=${oldestSyncedUid}`);
     for await (const msg of fetchIter) {
       if (processed >= MAX_PER_RUN) break;
       processed++;

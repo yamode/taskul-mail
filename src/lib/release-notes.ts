@@ -6,6 +6,13 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.4.3",
+    date: "2026-04-22",
+    changes: [
+      "imap-sync の hang を根本解決: forward/backfill 両モードで SEARCH + fetchOne ループ方式に統一。range fetch (182601:182680 等) で 1 件目 upsert 後に次応答待ちで永久停止するサーバ挙動を回避",
+    ],
+  },
+  {
     version: "0.4.2",
     date: "2026-04-22",
     changes: [
