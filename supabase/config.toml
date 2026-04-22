@@ -1,0 +1,21 @@
+project_id = "taskul-mail"
+
+# Edge Runtime の JWT 検証を無効化。
+# デフォルト検証は HS256 のみ対応で、Supabase Auth が発行する新形式 (ES256) の
+# access_token を弾いてしまうため。認可は各 Function 内で admin client の
+# auth.getUser(token) / service_role 権限で個別に行う。
+
+[functions.imap-sync]
+verify_jwt = false
+
+[functions.register-account]
+verify_jwt = false
+
+[functions.update-account-password]
+verify_jwt = false
+
+[functions.send-mail]
+verify_jwt = false
+
+[functions.generate-draft]
+verify_jwt = false

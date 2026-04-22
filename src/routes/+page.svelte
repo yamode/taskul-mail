@@ -1,6 +1,6 @@
 <script lang="ts">
   import { supabase, mail, fnUrl, authHeader } from "$lib/supabase";
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
 
   type Thread = {
     id: string;
@@ -45,10 +45,48 @@
       : threads.filter((t) => t.account_id === filterAccountId),
   );
 
+  let syncTimer: ReturnType<typeof setInterval> | null = null;
+  let syncing = $state(false);
+
+  async function syncTick() {
+    if (typeof document !== "undefined" && document.hidden) return;
+    if (syncing) return;
+    syncing = true;
+    try {
+      await fetch(fnUrl("imap-sync"), {
+        method: "POST",
+        headers: await authHeader(),
+      });
+      await loadThreads();
+      if (selectedThreadId) await loadMessages(selectedThreadId);
+    } catch (e) {
+      console.error("sync tick failed", e);
+    } finally {
+      syncing = false;
+    }
+  }
+
+  function onVisibility() {
+    if (!document.hidden) void syncTick();
+  }
+
   onMount(async () => {
     const { data: { user } } = await supabase.auth.getUser();
     userId = user?.id ?? null;
     await Promise.all([loadAccounts(), loadThreads()]);
+
+    // 受信トレイを開いている間は 60 秒ごとに IMAP 同期 → スレッド再読込。
+    // タブが非アクティブな間はスキップし、フォーカスが戻ったら即 1 回同期する。
+    syncTimer = setInterval(syncTick, 60_000);
+    document.addEventListener("visibilitychange", onVisibility);
+    void syncTick();
+  });
+
+  onDestroy(() => {
+    if (syncTimer) clearInterval(syncTimer);
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", onVisibility);
+    }
   });
 
   async function loadAccounts() {
@@ -99,18 +137,22 @@
     threads = base;
   }
 
-  async function openThread(t: Thread) {
-    selectedThreadId = t.id;
-    selectedMessageId = null;
-    draft = null;
+  async function loadMessages(threadId: string) {
     const { data } = await mail
       .from("messages")
       .select(
         "id,account_id,thread_id,from_address,from_name,to_addresses,cc_addresses,subject,body_text,received_at,direction",
       )
-      .eq("thread_id", t.id)
+      .eq("thread_id", threadId)
       .order("received_at", { ascending: true });
     messages = (data ?? []) as Message[];
+  }
+
+  async function openThread(t: Thread) {
+    selectedThreadId = t.id;
+    selectedMessageId = null;
+    draft = null;
+    await loadMessages(t.id);
     if (messages.length > 0) {
       const last = [...messages].reverse().find((m) => m.direction === "inbound");
       if (last) {

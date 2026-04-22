@@ -25,7 +25,7 @@ export async function createSecret(
   secret: string,
 ): Promise<string> {
   const { data, error } = await sb.rpc("vault_create_secret", {
-    p_secret: secret,
+    p_secret: sanitizeSecret(secret),
     p_name: name,
   });
   if (error) throw new Error(`vault create failed: ${error.message}`);
@@ -41,7 +41,12 @@ export async function readSecret(
   const { data, error } = await sb.rpc("vault_read_secret", { p_id: secretId });
   if (error) throw new Error(`vault read failed: ${error.message}`);
   if (!data) throw new Error(`vault read failed: secret not found`);
-  return data as string;
+  return sanitizeSecret(data as string);
+}
+
+/** 制御文字・前後空白を除去。IMAP LOGIN が "Error in IMAP command" で落ちるのを防ぐ */
+export function sanitizeSecret(s: string): string {
+  return s.replace(/[\x00-\x1f\x7f]/g, "").trim();
 }
 
 /** シークレット更新 */
@@ -52,7 +57,7 @@ export async function updateSecret(
 ): Promise<void> {
   const { error } = await sb.rpc("vault_update_secret", {
     p_id: secretId,
-    p_secret: newSecret,
+    p_secret: sanitizeSecret(newSecret),
   });
   if (error) throw new Error(`vault update failed: ${error.message}`);
 }

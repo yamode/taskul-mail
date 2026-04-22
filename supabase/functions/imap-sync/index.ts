@@ -23,6 +23,51 @@ type AccountRow = {
   last_uidvalidity: number | null;
 };
 
+/** 生TLS で AUTHENTICATE PLAIN を試すプレチェック。imapflow を使わず直接プロトコルを話す。
+ *  LOGIN コマンドで拒否されるが PLAIN SASL なら通るケース (パスワードに `}` を含む等) の切り分け用。 */
+async function rawAuthPlainProbe(
+  host: string,
+  port: number,
+  user: string,
+  pass: string,
+  log: string[],
+): Promise<"ok" | string> {
+  const conn = await Deno.connectTls({ hostname: host, port });
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const buf = new Uint8Array(16384);
+
+  const readChunk = async (): Promise<string> => {
+    const n = await conn.read(buf);
+    if (!n) return "";
+    return dec.decode(buf.subarray(0, n));
+  };
+
+  const write = async (s: string) => {
+    log.push(`PROBE>> ${s.replace(/\r\n/g, "\\r\\n")}`);
+    await conn.write(enc.encode(s));
+  };
+
+  try {
+    const greeting = await readChunk();
+    log.push(`PROBE<< ${greeting.trim()}`);
+
+    const payload = `\0${user}\0${pass}`;
+    const b64 = btoa(payload);
+    await write(`a1 AUTHENTICATE PLAIN ${b64}\r\n`);
+    const resp = await readChunk();
+    log.push(`PROBE<< ${resp.trim()}`);
+
+    await write(`a2 LOGOUT\r\n`);
+    try { await readChunk(); } catch { /* ignore */ }
+
+    if (/^a1 OK/m.test(resp)) return "ok";
+    return resp.trim();
+  } finally {
+    try { conn.close(); } catch { /* ignore */ }
+  }
+}
+
 function normalizeSubject(s: string | undefined): string {
   if (!s) return "";
   return s.replace(/^(\s*(re|fwd?|fw)\s*:\s*)+/gi, "").trim();
@@ -33,19 +78,52 @@ function snippetOf(text: string | undefined): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 200);
 }
 
-async function syncOneAccount(account: AccountRow) {
+async function syncOneAccount(account: AccountRow): Promise<Record<string, unknown>> {
   const sb = adminClient();
   const password = await readSecret(sb, account.password_secret_id);
+
+  const diag: Record<string, unknown> = {
+    user_len: account.username.length,
+    user_codes: [...account.username].map((c) => c.charCodeAt(0)),
+    pass_len: password.length,
+    pass_codes: [...password].map((c) => c.charCodeAt(0)),
+    imap_logs: [] as string[],
+  };
+  const imapLogs = diag.imap_logs as string[];
+
+  // 先に生 AUTH PLAIN で通るか確認 (imapflow の LOGIN は一部パスワードで拒否される)
+  try {
+    const probe = await rawAuthPlainProbe(
+      account.imap_host,
+      account.imap_port,
+      account.username,
+      password,
+      imapLogs,
+    );
+    diag.auth_plain_probe = probe;
+  } catch (e) {
+    diag.auth_plain_probe = `probe error: ${(e as Error).message}`;
+  }
 
   const client = new ImapFlow({
     host: account.imap_host,
     port: account.imap_port,
     secure: true,
     auth: { user: account.username, pass: password },
-    logger: false,
+    logger: {
+      debug: (o: unknown) => imapLogs.push(`DEBUG ${JSON.stringify(o)}`),
+      info: (o: unknown) => imapLogs.push(`INFO  ${JSON.stringify(o)}`),
+      warn: (o: unknown) => imapLogs.push(`WARN  ${JSON.stringify(o)}`),
+      error: (o: unknown) => imapLogs.push(`ERROR ${JSON.stringify(o)}`),
+    },
   });
 
-  await client.connect();
+  try {
+    await client.connect();
+  } catch (e) {
+    (e as { diag?: unknown }).diag = diag;
+    throw e;
+  }
   const lock = await client.getMailboxLock("INBOX");
 
   try {
@@ -62,6 +140,17 @@ async function syncOneAccount(account: AccountRow) {
       fromUid = 1;
     }
 
+    // 初回同期 (last_uid=0) は直近 100 件から。全件遡ると Edge Function が時間切れで落ちる。
+    const currentMaxUid = Number((mailbox as { uidNext?: number }).uidNext ?? 1) - 1;
+    if (account.last_uid === 0 && currentMaxUid > 100) {
+      fromUid = currentMaxUid - 99;
+    }
+
+    // 1 回の呼び出しで処理する上限。超えた分は次回の tick で続きを取る。
+    const MAX_PER_RUN = 50;
+    let processed = 0;
+    let hitLimit = false;
+
     let maxSeenUid = account.last_uid;
 
     // 差分フェッチ (source は本文込み)
@@ -70,6 +159,11 @@ async function syncOneAccount(account: AccountRow) {
       { uid: true, envelope: true, source: true, internalDate: true },
       { uid: true },
     )) {
+      if (processed >= MAX_PER_RUN) {
+        hitLimit = true;
+        break;
+      }
+      processed++;
       if (!msg.source) continue;
       const parsed = await simpleParser(msg.source);
 
@@ -199,10 +293,15 @@ async function syncOneAccount(account: AccountRow) {
         last_synced_at: new Date().toISOString(),
       })
       .eq("id", account.id);
+
+    diag.processed = processed;
+    diag.hit_limit = hitLimit;
+    diag.max_seen_uid = maxSeenUid;
   } finally {
     lock.release();
     await client.logout();
   }
+  return diag;
 }
 
 Deno.serve(async (req) => {
@@ -227,14 +326,30 @@ Deno.serve(async (req) => {
     return jsonResponse(req, { error: error.message }, 500);
   }
 
-  const results: Record<string, string> = {};
+  const results: Record<string, unknown> = {};
   for (const acc of (accounts ?? []) as AccountRow[]) {
     try {
-      await syncOneAccount(acc);
-      results[acc.email_address] = "ok";
+      const diag = await syncOneAccount(acc);
+      results[acc.email_address] = { status: "ok", diag };
     } catch (e) {
-      console.error(`sync failed for ${acc.email_address}`, e);
-      results[acc.email_address] = `error: ${(e as Error).message}`;
+      const err = e as Error & {
+        response?: string;
+        responseText?: string;
+        authenticationFailed?: boolean;
+        code?: string;
+        diag?: unknown;
+      };
+      console.error(`sync failed for ${acc.email_address}`, err);
+      const detail = err.authenticationFailed
+        ? "認証失敗 (パスワード or ユーザー名が違う or Xserver でメールパスワード未設定)"
+        : err.responseText || err.response || err.message;
+      results[acc.email_address] = {
+        status: "error",
+        detail,
+        response: err.response,
+        responseText: err.responseText,
+        diag: err.diag,
+      };
     }
   }
 

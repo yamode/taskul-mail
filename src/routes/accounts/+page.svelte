@@ -133,7 +133,6 @@
       method: "POST",
       headers: await authHeader(),
     });
-    alert("同期を開始しました (数秒〜数十秒)");
     setTimeout(loadAccounts, 3000);
   }
 
