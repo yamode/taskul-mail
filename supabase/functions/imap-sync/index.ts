@@ -91,20 +91,6 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
   };
   const imapLogs = diag.imap_logs as string[];
 
-  // 先に生 AUTH PLAIN で通るか確認 (imapflow の LOGIN は一部パスワードで拒否される)
-  try {
-    const probe = await rawAuthPlainProbe(
-      account.imap_host,
-      account.imap_port,
-      account.username,
-      password,
-      imapLogs,
-    );
-    diag.auth_plain_probe = probe;
-  } catch (e) {
-    diag.auth_plain_probe = `probe error: ${(e as Error).message}`;
-  }
-
   const client = new ImapFlow({
     host: account.imap_host,
     port: account.imap_port,
@@ -147,11 +133,12 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     }
 
     // 1 回の呼び出しで処理する上限。超えた分は次回の tick で続きを取る。
-    const MAX_PER_RUN = 50;
+    const MAX_PER_RUN = 200;
     let processed = 0;
     let hitLimit = false;
 
     let maxSeenUid = account.last_uid;
+    const touchedThreads = new Map<string, string>();
 
     // 差分フェッチ (source は本文込み)
     for await (const msg of client.fetch(
@@ -269,19 +256,22 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
         continue;
       }
 
-      // スレッドのメタ情報更新
-      await sb
-        .from("threads")
-        .update({
-          last_message_at: (parsed.date ?? new Date()).toISOString(),
-          message_count: (await sb
-            .from("messages")
-            .select("id", { count: "exact", head: true })
-            .eq("thread_id", threadId!)).count ?? 0,
-        })
-        .eq("id", threadId!);
+      // last_message_at のみ更新 (件数集計は最後にまとめて)
+      touchedThreads.set(threadId!, (parsed.date ?? new Date()).toISOString());
 
       if (Number(msg.uid) > maxSeenUid) maxSeenUid = Number(msg.uid);
+    }
+
+    // 触ったスレッドの message_count と last_message_at をまとめて更新
+    for (const [tid, lastAt] of touchedThreads) {
+      const { count } = await sb
+        .from("messages")
+        .select("id", { count: "exact", head: true })
+        .eq("thread_id", tid);
+      await sb
+        .from("threads")
+        .update({ last_message_at: lastAt, message_count: count ?? 0 })
+        .eq("id", tid);
     }
 
     // アカウントの同期ステート更新
@@ -326,32 +316,35 @@ Deno.serve(async (req) => {
     return jsonResponse(req, { error: error.message }, 500);
   }
 
+  // アカウントを並列で同期。認証失敗しているアカウントが他の処理を待たせないように。
   const results: Record<string, unknown> = {};
-  for (const acc of (accounts ?? []) as AccountRow[]) {
-    try {
-      const diag = await syncOneAccount(acc);
-      results[acc.email_address] = { status: "ok", diag };
-    } catch (e) {
-      const err = e as Error & {
-        response?: string;
-        responseText?: string;
-        authenticationFailed?: boolean;
-        code?: string;
-        diag?: unknown;
-      };
-      console.error(`sync failed for ${acc.email_address}`, err);
-      const detail = err.authenticationFailed
-        ? "認証失敗 (パスワード or ユーザー名が違う or Xserver でメールパスワード未設定)"
-        : err.responseText || err.response || err.message;
-      results[acc.email_address] = {
-        status: "error",
-        detail,
-        response: err.response,
-        responseText: err.responseText,
-        diag: err.diag,
-      };
-    }
-  }
+  await Promise.all(
+    ((accounts ?? []) as AccountRow[]).map(async (acc) => {
+      try {
+        const diag = await syncOneAccount(acc);
+        results[acc.email_address] = { status: "ok", diag };
+      } catch (e) {
+        const err = e as Error & {
+          response?: string;
+          responseText?: string;
+          authenticationFailed?: boolean;
+          code?: string;
+          diag?: unknown;
+        };
+        console.error(`sync failed for ${acc.email_address}`, err);
+        const detail = err.authenticationFailed
+          ? "認証失敗 (パスワード or ユーザー名が違う or Xserver でメールパスワード未設定)"
+          : err.responseText || err.response || err.message;
+        results[acc.email_address] = {
+          status: "error",
+          detail,
+          response: err.response,
+          responseText: err.responseText,
+          diag: err.diag,
+        };
+      }
+    }),
+  );
 
   return jsonResponse(req, { results });
 });
