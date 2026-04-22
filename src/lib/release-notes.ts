@@ -6,6 +6,14 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.7.2",
+    date: "2026-04-22",
+    changes: [
+      "default_tone カラム未作成環境でも Edge Functions が落ちないようフォールバック追加 (generate-draft / register-account / accounts 編集)",
+      "imap-sync の first (初回) 同期も SEARCH + fetchOne 方式に統一: range fetch の hang を初回にも適用、recruit@ など未同期アカウントの初回同期が hang しにくくなった",
+    ],
+  },
+  {
     version: "0.7.1",
     date: "2026-04-22",
     changes: [

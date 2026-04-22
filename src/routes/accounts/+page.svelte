@@ -83,21 +83,26 @@
     editSaving = true;
     try {
       // メタ情報の更新 (password 以外)
-      const { error: uErr } = await mail
+      // default_tone カラム未作成時のフォールバック付き
+      const base = {
+        label: editing.label,
+        email_address: editing.email_address,
+        username: editing.username,
+        imap_host: editing.imap_host,
+        imap_port: Number(editing.imap_port),
+        smtp_host: editing.smtp_host,
+        smtp_port: Number(editing.smtp_port),
+        is_shared: editing.is_shared,
+      };
+      let uRes = await mail
         .from("accounts")
-        .update({
-          label: editing.label,
-          email_address: editing.email_address,
-          username: editing.username,
-          imap_host: editing.imap_host,
-          imap_port: Number(editing.imap_port),
-          smtp_host: editing.smtp_host,
-          smtp_port: Number(editing.smtp_port),
-          is_shared: editing.is_shared,
-          default_tone: editing.default_tone ?? "",
-        })
+        .update({ ...base, default_tone: editing.default_tone ?? "" })
         .eq("id", editing.id);
-      if (uErr) throw uErr;
+      if (uRes.error && /default_tone/.test(uRes.error.message ?? "")) {
+        uRes = await mail.from("accounts").update(base).eq("id", editing.id);
+        alert("既定トーンは保存されませんでした。\nSQL Editor で以下を実行してください:\nalter table mail.accounts add column if not exists default_tone text not null default '';");
+      }
+      if (uRes.error) throw uRes.error;
 
       // パスワードが入力されていれば Vault 経由で更新
       if (editPassword) {

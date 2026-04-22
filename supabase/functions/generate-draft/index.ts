@@ -71,11 +71,26 @@ Deno.serve(async (req) => {
     if (tErr || !target) throw new Error("message not found");
 
     // service_role では auth.uid() が効かないので明示チェック
-    const { data: acc } = await sb
-      .from("accounts")
-      .select("owner_id,is_shared,default_tone")
-      .eq("id", target.account_id)
-      .single<{ owner_id: string; is_shared: boolean; default_tone?: string }>();
+    // default_tone カラム未作成 (migration 20260422000008 未適用) でも落ちないようフォールバック
+    type AccRow = { owner_id: string; is_shared: boolean; default_tone?: string };
+    let acc: AccRow | null = null;
+    {
+      const { data, error } = await sb
+        .from("accounts")
+        .select("owner_id,is_shared,default_tone")
+        .eq("id", target.account_id)
+        .single<AccRow>();
+      if (error && /default_tone/.test(error.message ?? "")) {
+        const { data: d2 } = await sb
+          .from("accounts")
+          .select("owner_id,is_shared")
+          .eq("id", target.account_id)
+          .single<AccRow>();
+        acc = d2 ?? null;
+      } else if (!error) {
+        acc = data;
+      }
+    }
     if (!acc) throw new Error("account not found");
 
     let allowed = acc.owner_id === userId;

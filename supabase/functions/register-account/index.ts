@@ -48,23 +48,33 @@ Deno.serve(async (req) => {
     const secretId = await createSecret(sb, secretName, password);
 
     // アカウント作成
-    const { data, error } = await sb
+    // default_tone カラム未作成 (migration 20260422000008 未適用) でも
+    // 登録自体は成功させたいので、失敗時は default_tone を外して再試行。
+    const basePayload = {
+      owner_id: userId,
+      label,
+      email_address,
+      username: email_address,
+      imap_host,
+      imap_port,
+      smtp_host,
+      smtp_port,
+      password_secret_id: secretId,
+      is_shared,
+    };
+    let insertRes = await sb
       .from("accounts")
-      .insert({
-        owner_id: userId,
-        label,
-        email_address,
-        username: email_address,
-        imap_host,
-        imap_port,
-        smtp_host,
-        smtp_port,
-        password_secret_id: secretId,
-        is_shared,
-        default_tone,
-      })
+      .insert({ ...basePayload, default_tone })
       .select("id")
       .single();
+    if (insertRes.error && /default_tone/.test(insertRes.error.message ?? "")) {
+      insertRes = await sb
+        .from("accounts")
+        .insert(basePayload)
+        .select("id")
+        .single();
+    }
+    const { data, error } = insertRes;
     if (error) throw error;
 
     // 共有アカウントなら owner をメンバーにも登録
