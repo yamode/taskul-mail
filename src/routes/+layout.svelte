@@ -1,5 +1,7 @@
 <script lang="ts">
   import { supabase } from "$lib/supabase";
+  import ReleaseNotesModal from "$lib/components/ReleaseNotesModal.svelte";
+  import { version } from "../../package.json";
   import { onMount } from "svelte";
 
   let { children } = $props();
@@ -7,6 +9,7 @@
   let loading = $state(true);
   let email = $state("");
   let password = $state("");
+  let showReleaseNotes = $state(false);
 
   onMount(async () => {
     const { data } = await supabase.auth.getSession();
@@ -40,6 +43,9 @@
   {:else}
     <header>
       <strong>tasukul mail</strong>
+      <button class="header-version" onclick={() => (showReleaseNotes = true)}>
+        v{version}
+      </button>
       <nav>
         <a href="/">受信トレイ</a>
         <a href="/drafts">下書き</a>
@@ -50,6 +56,7 @@
       <button onclick={signOut}>ログアウト</button>
     </header>
     {@render children()}
+    <ReleaseNotesModal bind:open={showReleaseNotes} />
   {/if}
 </main>
 
@@ -72,6 +79,16 @@
     border-bottom: 1px solid #e5e7eb;
   }
   header strong { flex: 0; }
+  .header-version {
+    background: rgba(0,0,0,0.05);
+    border: none;
+    color: #6b7280;
+    font-size: 0.72rem;
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .header-version:hover { color: #374151; background: rgba(0,0,0,0.08); }
   header nav { display: flex; gap: 0.75rem; }
   header nav a {
     color: #374151;
