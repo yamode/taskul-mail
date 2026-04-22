@@ -245,7 +245,9 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     // 連続 3 件スキップしたら imapflow の状態が壊れた可能性が高いので打ち切り。
     // スキップした UID は maxSeenUid に反映して last_uid を前進させる
     // (そうしないと次回も同じ UID で失敗する無限ループに陥る)。
-    const FETCH_TIMEOUT_MS = 15_000;
+    // 添付が大きいメール (数MB〜) だと 15s では source DL が間に合わず timeout するため 45s に拡大。
+    // MAX_CONSECUTIVE_SKIPS=3 と組み合わせて最悪 135s で中断するので Edge Function の wall clock 内に収まる。
+    const FETCH_TIMEOUT_MS = 45_000;
     const MAX_CONSECUTIVE_SKIPS = 3;
     const skippedUids: number[] = [];
     const fetchIter = (async function* () {
