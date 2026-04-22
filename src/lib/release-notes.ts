@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.6.1",
+    date: "2026-04-22",
+    changes: [
+      "返信コンポーズ画面にトーン表示を復活: アカウントの既定トーン (基本) と 今回の追加指示 (hint) を 2 段で表示・入力。✨ 再生成は両方を併記して Claude に渡す",
+      "既定トーンが未設定のアカウントは「未設定 — アカウント設定で登録」リンクを表示",
+      "generate-draft Edge Function: 基本トーンを常に適用し、追加指示があれば併記するよう変更",
+    ],
+  },
+  {
     version: "0.6.0",
     date: "2026-04-22",
     changes: [

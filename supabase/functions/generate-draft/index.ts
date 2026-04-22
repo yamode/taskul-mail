@@ -116,14 +116,18 @@ Deno.serve(async (req) => {
       })
       .join("\n\n");
 
-    // hint が明示指定されていればそれを優先、無ければアカウントの default_tone を使う
-    const effectiveHint = (hint && String(hint).trim().length > 0)
-      ? String(hint)
-      : (acc.default_tone && acc.default_tone.trim().length > 0 ? acc.default_tone : "");
+    // アカウント既定トーン + 追加指示 (hint) の組み合わせで指示を構築。
+    // 両方あれば両方併記、片方だけならそれのみ。
+    const baseTone = (acc.default_tone ?? "").trim();
+    const extraHint = typeof hint === "string" ? hint.trim() : "";
+    const toneBlocks: string[] = [];
+    if (baseTone) toneBlocks.push(`【アカウント基本トーン】\n${baseTone}`);
+    if (extraHint) toneBlocks.push(`【今回の追加指示】\n${extraHint}`);
+    const toneSection = toneBlocks.length > 0 ? `\n${toneBlocks.join("\n\n")}\n` : "";
 
     const userPrompt = [
       "以下のメールスレッドに対して、最新メッセージへの返信下書きを作成してください。",
-      effectiveHint ? `\n【トーン・スタイル指示】\n${effectiveHint}` : "",
+      toneSection,
       "\n【スレッド履歴 (古い順)】\n",
       contextLines,
       "\n\n【返信対象 (最新)】\n",
@@ -131,6 +135,9 @@ Deno.serve(async (req) => {
       `From: ${target.from_name ?? ""} <${target.from_address ?? ""}>`,
       `\n${target.body_text ?? ""}`,
     ].join("\n");
+
+    // 下書きに記録するヒント: 追加指示があればそれを、無ければ基本トーンを記録
+    const recordedHint = extraHint || baseTone || null;
 
     const anthropic = new Anthropic({
       apiKey: Deno.env.get("ANTHROPIC_API_KEY")!,
@@ -168,7 +175,7 @@ Deno.serve(async (req) => {
         subject: parsed.subject,
         body_text: parsed.body_text,
         generated_by_ai: true,
-        ai_prompt_hint: effectiveHint || null,
+        ai_prompt_hint: recordedHint,
         status: "draft",
       })
       .select("id,subject,body_text")

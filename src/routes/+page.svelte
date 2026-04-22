@@ -26,7 +26,7 @@
     received_at: string;
     direction: string;
   };
-  type Account = { id: string; label: string; is_shared: boolean; sort_order?: number; unread_count?: number };
+  type Account = { id: string; label: string; is_shared: boolean; sort_order?: number; default_tone?: string; unread_count?: number };
 
   // 返信/転送時のインラインコンポーズ状態。
   // gmail のように本文エリアを返信レイアウトに入れ替える。
@@ -51,6 +51,7 @@
   let compose = $state<Compose | null>(null);
   let generating = $state(false);
   let sending = $state(false);
+  let hint = $state("");
   let userId = $state<string | null>(null);
   let hoverThreadId = $state<string | null>(null);
 
@@ -211,11 +212,21 @@
   });
 
   async function loadAccounts() {
-    const { data } = await mail
+    // default_tone カラム未適用環境へのフォールバック付き
+    const { data, error } = await mail
       .from("accounts")
-      .select("id,label,is_shared,sort_order")
+      .select("id,label,is_shared,sort_order,default_tone")
       .order("sort_order")
       .order("created_at");
+    if (error && /default_tone/.test(error.message ?? "")) {
+      const { data: data2 } = await mail
+        .from("accounts")
+        .select("id,label,is_shared,sort_order")
+        .order("sort_order")
+        .order("created_at");
+      accounts = (data2 ?? []) as Account[];
+      return;
+    }
     accounts = (data ?? []) as Account[];
   }
 
@@ -532,7 +543,7 @@
       const res = await fetch(fnUrl("generate-draft"), {
         method: "POST",
         headers: { "content-type": "application/json", ...(await authHeader()) },
-        body: JSON.stringify({ message_id: selectedMessageId }),
+        body: JSON.stringify({ message_id: selectedMessageId, hint: hint || undefined }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "failed");
@@ -758,6 +769,11 @@
     {#if messages.length === 0 && !compose}
       <p class="empty">スレッドを選択してください</p>
     {:else if compose}
+      {@const composeAcct = accounts.find((a) => {
+        const src = messages.find((m) => m.id === compose!.sourceMessageId);
+        return a.id === src?.account_id;
+      })}
+      {@const baseTone = composeAcct?.default_tone ?? ""}
       <!-- ===== 返信/転送インライン展開 ===== -->
       <header class="compose-header">
         <div class="compose-header-row">
@@ -769,7 +785,7 @@
             class="ai"
             onclick={generateDraft}
             disabled={generating || compose.mode !== "reply"}
-            title="アカウント設定のトーンで Claude 再生成"
+            title="Claude で再生成 (アカウント基本トーン + 追加指示)"
           >
             {generating ? "生成中…" : "✨ 再生成"}
           </button>
@@ -780,6 +796,26 @@
             {sending ? "送信中…" : "▶ 送信"}
           </button>
         </div>
+        {#if compose.mode === "reply"}
+          <div class="compose-header-row tone-row">
+            <div class="tone-base" title="このアカウントの既定トーン (アカウント設定で変更)">
+              <span class="tone-base-label">基本トーン</span>
+              {#if baseTone}
+                <span class="tone-base-value">{baseTone}</span>
+              {:else}
+                <a class="tone-base-empty" href="/accounts">未設定 — アカウント設定で登録</a>
+              {/if}
+            </div>
+            <label class="tone-hint">
+              <span>追加指示</span>
+              <input
+                type="text"
+                placeholder="例: 今回は特に急ぎで、日程を 2 案提示して (空欄可)"
+                bind:value={hint}
+              />
+            </label>
+          </div>
+        {/if}
       </header>
       <div class="compose">
         <div class="field-row">
@@ -1144,6 +1180,67 @@
   .compose-header .ai:hover:not(:disabled) { background: #e0e7ff; }
   .compose-header .ai:disabled { opacity: 0.5; cursor: not-allowed; }
 
+  .tone-row {
+    background: #f9fafb;
+    border-radius: 4px;
+    padding: 0.35rem 0.6rem;
+    gap: 0.75rem;
+  }
+  .tone-base {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-width: 0;
+    max-width: 45%;
+  }
+  .tone-base-label {
+    font-size: 0.72rem;
+    color: #6b7280;
+    background: #e5e7eb;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .tone-base-value {
+    font-size: 0.82rem;
+    color: #374151;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tone-base-empty {
+    font-size: 0.78rem;
+    color: #b45309;
+    text-decoration: none;
+  }
+  .tone-base-empty:hover { text-decoration: underline; }
+  .tone-hint {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex: 1;
+    min-width: 0;
+  }
+  .tone-hint > span {
+    font-size: 0.72rem;
+    color: #6b7280;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .tone-hint > input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid #e5e7eb;
+    background: #fff;
+    border-radius: 4px;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.85rem;
+    font-family: inherit;
+  }
+  .tone-hint > input:focus { outline: 2px solid #bfdbfe; border-color: #60a5fa; }
 
   .compose {
     padding: 1rem 1.25rem 2rem;
