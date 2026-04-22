@@ -1,0 +1,16 @@
+services:
+  idle:
+    build: .
+    container_name: taskul-mail-idle
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:3099:3099"
+    networks:
+      - default
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,22 @@
+{
+  "name": "taskul-mail-idle",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "IMAP IDLE worker for taskul-mail (runs on VPS)",
+  "scripts": {
+    "start": "node --enable-source-maps dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.46.0",
+    "imapflow": "^1.0.164",
+    "pino": "^9.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}

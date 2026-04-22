@@ -1575,9 +1575,7 @@
             <span class="shared-badge" title="共有アカウント">共</span>
           {/if}
           <span class="account-label">{a.label}</span>
-          {#if !accountsCollapsed && s?.syncing}
-            <span class="acct-spin" title="同期中" aria-hidden="true"></span>
-          {:else if !accountsCollapsed && s?.error}
+          {#if !accountsCollapsed && s?.error}
             <span
               class="acct-err"
               title={`前回エラー: ${s.error} — クリックで再試行`}
@@ -2353,15 +2351,6 @@
   .account-unread {
     background: #ef4444; color: #fff; font-size: 0.7rem; font-weight: 700;
     padding: 0.1rem 0.4rem; border-radius: 9px; min-width: 1.4rem; text-align: center;
-  }
-  .acct-spin {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    border: 2px solid #d1d5db;
-    border-top-color: #2563eb;
-    animation: spin 0.8s linear infinite;
-    flex-shrink: 0;
   }
   .acct-err {
     color: #b45309;
