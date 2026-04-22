@@ -392,7 +392,9 @@ async function syncOneAccount(
       }
 
       if (!threadId) {
-        // 同件名で直近 14 日以内のスレッドに合流、なければ新規
+        // References/In-Reply-To でヒットしない場合のフォールバック:
+        // 同件名で直近 72 時間以内のスレッドに合流、なければ新規
+        // (14 日窓では「本日のご予約について」など頻出件名が誤結合するため 72h に縮小)
         const { data: recent } = await sb
           .from("threads")
           .select("id")
@@ -400,7 +402,7 @@ async function syncOneAccount(
           .eq("subject_normalized", subjectNorm)
           .gte(
             "last_message_at",
-            new Date(Date.now() - 14 * 24 * 3600 * 1000).toISOString(),
+            new Date(Date.now() - 72 * 3600 * 1000).toISOString(),
           )
           .order("last_message_at", { ascending: false })
           .limit(1)

@@ -178,6 +178,17 @@
     accounts.map((a) => acctSync[a.id]?.error).find((e) => !!e) ?? null,
   );
 
+  // タブタイトルに未読合計を表示 (gmail 互換)
+  //   - accounts.unread_count は loadThreads 内で集計済み
+  //   - SSR (document 未定義) では no-op
+  let totalUnread = $derived(
+    accounts.reduce((sum, a) => sum + (a.unread_count ?? 0), 0),
+  );
+  $effect(() => {
+    if (typeof document === "undefined") return;
+    document.title = totalUnread > 0 ? `(${totalUnread}) taskul-mail` : "taskul-mail";
+  });
+
   // Gmail ライクなリアルタイム性:
   //   (a) Supabase Realtime で mail.messages INSERT を購読し、即座に反映
   //   (b) 15 秒ごとに threads テーブルだけを軽量 poll するフォールバック
@@ -285,6 +296,37 @@
             if (selectedThreadId) void loadCommentsForOpenThread();
             // スレッド一覧のバッジ数も更新
             void refreshCommentCounts();
+          },
+        )
+        .on(
+          // 既読状態: 共有アカウントで他メンバーが既読にした場合も即反映
+          // @ts-ignore
+          "postgres_changes",
+          { event: "*", schema: "mail", table: "message_reads" },
+          () => {
+            void loadThreads();
+          },
+        )
+        .on(
+          // 下書き: 他端末で編集/削除した下書きの件数を即反映
+          // @ts-ignore
+          "postgres_changes",
+          { event: "*", schema: "mail", table: "drafts" },
+          () => {
+            void refreshDraftCounts();
+            // 下書き一覧を開いていれば再読込
+            if (view === "drafts" && filterAccountId) {
+              void loadDraftsForAccount(filterAccountId);
+            }
+          },
+        )
+        .on(
+          // スレッド更新: trash / archive などを他端末/他メンバーに即反映
+          // @ts-ignore
+          "postgres_changes",
+          { event: "UPDATE", schema: "mail", table: "threads" },
+          () => {
+            void loadThreads();
           },
         )
         .subscribe();
