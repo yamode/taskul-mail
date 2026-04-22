@@ -6,6 +6,45 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.10.0",
+    date: "2026-04-22",
+    changes: [
+      "メール一覧の青ラベルを「アカウント名」から「そのスレッドの最新送信者 (from_name / from_address)」に変更。誰からのメールかを一目で判別できるように",
+      "社内メモをスレッド単位に集約表示。詳細ペイン上部に sticky で配置し、返信・転送作成中もそのまま参照可能に (旧: メッセージごとに個別入力)",
+      "アカウントごとの「📝 下書き」ボタンを受信トレイヘッダに追加。クリックで同アカウントの下書き一覧と編集ペインを詳細エリアに表示 (宛先・Cc・件名・本文編集 / 保存 / 破棄 / 送信)",
+    ],
+  },
+  {
+    version: "0.9.4",
+    date: "2026-04-22",
+    changes: [
+      "wheel リスナーを translate で動く .thread-row から動かない親 .thread-swipe に張り替え。行が大きくずれてもポインタから外れず、メール一覧幅いっぱいまでスムーズにスワイプできるように",
+    ],
+  },
+  {
+    version: "0.9.3",
+    date: "2026-04-22",
+    changes: [
+      "wheel スワイプは閾値到達でも即発火せず、500ms 無操作でスワイプ終了と判定して finalize (閾値越えなら削除、未達ならリセット)",
+      "削除発火後は水平 wheel が 300ms 止むまで全行の wheel 処理をロック。1 ジェスチャで momentum 余波により複数行が削除されるのを防止",
+    ],
+  },
+  {
+    version: "0.9.2",
+    date: "2026-04-22",
+    changes: [
+      "wheel 無操作タイムアウトを 120ms → 500ms に延長し、閾値を越えた時点でタイマーを待たず即発火に変更。Mac トラックパッドで時間をかけてスワイプしても途中でキャンセル扱いにならない",
+    ],
+  },
+  {
+    version: "0.9.1",
+    date: "2026-04-22",
+    changes: [
+      "html/body に overscroll-behavior-x: none を設定し、Mac トラックパッド 2 本指スワイプで発火するブラウザの戻るジェスチャを全面抑止",
+      ".threads にも overflow-x: hidden と overscroll-behavior-x: none を追加し、グリッド内での横スクロールを完全遮断",
+    ],
+  },
+  {
     version: "0.9.0",
     date: "2026-04-22",
     changes: [

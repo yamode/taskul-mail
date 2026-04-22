@@ -13,6 +13,8 @@
     trashed_at?: string | null;
     account_label?: string;
     unread_count?: number;
+    last_from_name?: string | null;
+    last_from_address?: string | null;
   };
   type Message = {
     id: string;
@@ -58,6 +60,8 @@
   let threads = $state<Thread[]>([]);
   let accounts = $state<Account[]>([]);
   let filterAccountId = $state<string>("");
+  // 詳細ペインの表示モード: 受信トレイ / 下書き一覧
+  let view = $state<"inbox" | "drafts">("inbox");
   let selectedThreadId = $state<string | null>(null);
   let messages = $state<Message[]>([]);
   let selectedMessageId = $state<string | null>(null);
@@ -106,8 +110,18 @@
   //   - commentDraft: 各メッセージの入力フォームの内容
   let commentsByMessage = $state<Record<string, Comment[]>>({});
   let commentCountByThread = $state<Record<string, number>>({});
-  let commentDraft = $state<Record<string, string>>({});
-  let commentSaving = $state<Record<string, boolean>>({});
+  let threadCommentDraft = $state<Record<string, string>>({});
+  let threadCommentSaving = $state<Record<string, boolean>>({});
+
+  // スレッド単位に平坦化したメモ (受信順)
+  let threadComments = $derived.by<Comment[]>(() => {
+    const arr: Comment[] = [];
+    for (const m of messages) {
+      for (const c of commentsByMessage[m.id] ?? []) arr.push(c);
+    }
+    arr.sort((a, b) => a.created_at.localeCompare(b.created_at));
+    return arr;
+  });
 
   let filtered = $derived(
     filterAccountId
@@ -228,7 +242,7 @@
       (meta.full_name as string | undefined) ??
       (meta.name as string | undefined) ??
       null;
-    await Promise.all([loadAccounts(), loadThreads()]);
+    await Promise.all([loadAccounts(), loadThreads(), refreshDraftCounts()]);
 
     // IMAP 同期は 60 秒に 1 回 (重いので頻度据え置き)
     syncTimer = setInterval(syncTick, IMAP_SYNC_INTERVAL);
@@ -316,6 +330,8 @@
 
   function selectAccount(id: string) {
     filterAccountId = id;
+    view = "inbox";
+    selectedDraft = null;
     try { localStorage.setItem("taskul-mail.filter-account-id", id); } catch { /* ignore */ }
   }
 
@@ -565,15 +581,29 @@
       unread_count: perAccount.get(a.id) ?? 0,
     }));
 
-    // スレッド別コメント件数 (バッジ表示用)
+    // スレッド別コメント件数 (バッジ表示用) + 最新メッセージの送信者
     if (base.length > 0) {
       const threadIds = base.map((t) => t.id);
       const { data: threadMsgs } = await mail
         .from("messages")
-        .select("id,thread_id")
-        .in("thread_id", threadIds);
+        .select("id,thread_id,from_name,from_address,received_at")
+        .in("thread_id", threadIds)
+        .order("received_at", { ascending: false });
       const msgToThread = new Map<string, string>();
-      for (const m of (threadMsgs ?? []) as any[]) msgToThread.set(m.id, m.thread_id);
+      const latestByThread = new Map<string, { from_name: string | null; from_address: string | null }>();
+      for (const m of (threadMsgs ?? []) as any[]) {
+        msgToThread.set(m.id, m.thread_id);
+        if (!latestByThread.has(m.thread_id)) {
+          latestByThread.set(m.thread_id, { from_name: m.from_name, from_address: m.from_address });
+        }
+      }
+      for (const t of base) {
+        const l = latestByThread.get(t.id);
+        if (l) {
+          t.last_from_name = l.from_name;
+          t.last_from_address = l.from_address;
+        }
+      }
       if (msgToThread.size > 0) {
         const { data: cmts } = await mail
           .from("message_comments")
@@ -1164,15 +1194,18 @@
     commentCountByThread = counts;
   }
 
-  async function addComment(messageId: string) {
+  // スレッド単位でメモ追加 (最新メッセージに紐付ける)
+  async function addThreadComment(threadId: string) {
     if (!userId) return;
-    const body = (commentDraft[messageId] ?? "").trim();
+    const body = (threadCommentDraft[threadId] ?? "").trim();
     if (!body) return;
-    commentSaving = { ...commentSaving, [messageId]: true };
+    const target = [...messages].reverse()[0];
+    if (!target) return;
+    threadCommentSaving = { ...threadCommentSaving, [threadId]: true };
     const { data, error } = await mail
       .from("message_comments")
       .insert({
-        message_id: messageId,
+        message_id: target.id,
         author_id: userId,
         author_email: userEmail,
         author_name: userDisplayName,
@@ -1180,7 +1213,7 @@
       })
       .select("id,message_id,author_id,author_email,author_name,body,created_at,updated_at")
       .single();
-    commentSaving = { ...commentSaving, [messageId]: false };
+    threadCommentSaving = { ...threadCommentSaving, [threadId]: false };
     if (error) {
       alert(`コメント投稿に失敗: ${error.message}`);
       return;
@@ -1188,15 +1221,13 @@
     const inserted = data as Comment;
     commentsByMessage = {
       ...commentsByMessage,
-      [messageId]: [...(commentsByMessage[messageId] ?? []), inserted],
+      [target.id]: [...(commentsByMessage[target.id] ?? []), inserted],
     };
-    commentDraft = { ...commentDraft, [messageId]: "" };
-    if (selectedThreadId) {
-      commentCountByThread = {
-        ...commentCountByThread,
-        [selectedThreadId]: (commentCountByThread[selectedThreadId] ?? 0) + 1,
-      };
-    }
+    threadCommentDraft = { ...threadCommentDraft, [threadId]: "" };
+    commentCountByThread = {
+      ...commentCountByThread,
+      [threadId]: (commentCountByThread[threadId] ?? 0) + 1,
+    };
   }
 
   async function deleteComment(c: Comment) {
@@ -1249,6 +1280,108 @@
   // 宛先入力のパース
   function parseAddrs(s: string): string[] {
     return s.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
+  }
+
+  // ------------------------------------------------------------
+  // 下書き一覧 (アカウント単位)
+  // ------------------------------------------------------------
+  type DraftRow = {
+    id: string;
+    account_id: string;
+    subject: string | null;
+    body_text: string | null;
+    to_addresses: string[];
+    cc_addresses: string[] | null;
+    status: string;
+    generated_by_ai: boolean;
+    updated_at: string;
+  };
+  let drafts = $state<DraftRow[]>([]);
+  let draftCountByAccount = $state<Record<string, number>>({});
+  let selectedDraft = $state<DraftRow | null>(null);
+  let draftSending = $state(false);
+
+  async function refreshDraftCounts() {
+    const { data } = await mail
+      .from("drafts")
+      .select("account_id")
+      .eq("status", "draft");
+    const counts: Record<string, number> = {};
+    for (const r of (data ?? []) as any[]) {
+      counts[r.account_id] = (counts[r.account_id] ?? 0) + 1;
+    }
+    draftCountByAccount = counts;
+  }
+
+  async function loadDraftsForAccount(accountId: string) {
+    const { data } = await mail
+      .from("drafts")
+      .select("id,account_id,subject,body_text,to_addresses,cc_addresses,status,generated_by_ai,updated_at")
+      .eq("account_id", accountId)
+      .eq("status", "draft")
+      .order("updated_at", { ascending: false });
+    drafts = (data ?? []) as DraftRow[];
+  }
+
+  function openDraftsView() {
+    if (!filterAccountId) return;
+    view = "drafts";
+    selectedDraft = null;
+    compose = null;
+    void loadDraftsForAccount(filterAccountId);
+  }
+
+  function closeDraftsView() {
+    view = "inbox";
+    selectedDraft = null;
+  }
+
+  async function saveSelectedDraft() {
+    if (!selectedDraft) return;
+    await mail
+      .from("drafts")
+      .update({
+        subject: selectedDraft.subject,
+        body_text: selectedDraft.body_text,
+        to_addresses: selectedDraft.to_addresses,
+        cc_addresses: selectedDraft.cc_addresses ?? [],
+      })
+      .eq("id", selectedDraft.id);
+    await loadDraftsForAccount(filterAccountId);
+    void refreshDraftCounts();
+  }
+
+  async function discardSelectedDraft() {
+    if (!selectedDraft) return;
+    if (!confirm("この下書きを破棄しますか？")) return;
+    await mail.from("drafts").update({ status: "discarded" }).eq("id", selectedDraft.id);
+    selectedDraft = null;
+    await loadDraftsForAccount(filterAccountId);
+    void refreshDraftCounts();
+  }
+
+  async function sendSelectedDraft() {
+    if (!selectedDraft) return;
+    if (!confirm("送信しますか？")) return;
+    draftSending = true;
+    try {
+      await saveSelectedDraft();
+      const res = await fetch(fnUrl("send-mail"), {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(await authHeader()) },
+        body: JSON.stringify({ draft_id: selectedDraft.id }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "failed");
+      alert("送信しました");
+      selectedDraft = null;
+      await loadDraftsForAccount(filterAccountId);
+      void refreshDraftCounts();
+    } catch (e) {
+      alert(`送信失敗: ${(e as Error).message}`);
+    } finally {
+      draftSending = false;
+    }
   }
 </script>
 
@@ -1359,6 +1492,14 @@
           >✉ 新規作成</button>
           <button
             class="ih-btn"
+            onclick={openDraftsView}
+            class:selected={view === "drafts"}
+            title="このアカウントの下書き一覧"
+          >
+            📝 下書き{#if (draftCountByAccount[currentAccount.id] ?? 0) > 0} ({draftCountByAccount[currentAccount.id]}){/if}
+          </button>
+          <button
+            class="ih-btn"
             onclick={openToneModal}
             title="このアカウントの AI トーン設定を編集"
           >✨ AI 設定</button>
@@ -1382,7 +1523,9 @@
         >
           <button class="thread" onclick={() => openThread(t)}>
             <div class="meta">
-              <span class="label">{t.account_label ?? ""}</span>
+              <span class="label" title={t.last_from_address ?? ""}>
+                {t.last_from_name || t.last_from_address || t.account_label || ""}
+              </span>
               <span class="date">
                 {new Date(t.last_message_at).toLocaleDateString("ja-JP")}
               </span>
@@ -1423,9 +1566,132 @@
   </aside>
 
   <section class="detail">
-    {#if messages.length === 0 && !compose}
+    {#if view === "drafts" && currentAccount}
+      <!-- ===== アカウント別 下書き一覧 & 編集 ===== -->
+      <header class="drafts-header">
+        <button class="back" onclick={closeDraftsView} title="受信トレイに戻る">← 受信トレイ</button>
+        <span class="drafts-title">📝 {currentAccount.label} の下書き ({drafts.length})</span>
+      </header>
+      <div class="drafts-layout">
+        <aside class="drafts-list">
+          {#each drafts as d (d.id)}
+            <button
+              class="draft-item"
+              class:selected={selectedDraft?.id === d.id}
+              onclick={() => (selectedDraft = { ...d })}
+            >
+              <div class="draft-meta">
+                {#if d.generated_by_ai}<span class="ai">AI</span>{/if}
+                <span class="draft-date">{new Date(d.updated_at).toLocaleDateString("ja-JP")}</span>
+              </div>
+              <div class="draft-subj">{d.subject || "(件名なし)"}</div>
+              <div class="draft-to">→ {(d.to_addresses ?? []).join(", ") || "(宛先なし)"}</div>
+            </button>
+          {/each}
+          {#if drafts.length === 0}
+            <p class="empty-list">下書きはありません</p>
+          {/if}
+        </aside>
+        <div class="drafts-edit">
+          {#if selectedDraft}
+            <label class="df-field">
+              <span>宛先</span>
+              <input
+                type="text"
+                value={(selectedDraft.to_addresses ?? []).join(", ")}
+                oninput={(e) => (selectedDraft!.to_addresses = parseAddrs((e.target as HTMLInputElement).value))}
+              />
+            </label>
+            <label class="df-field">
+              <span>Cc</span>
+              <input
+                type="text"
+                value={(selectedDraft.cc_addresses ?? []).join(", ")}
+                oninput={(e) => (selectedDraft!.cc_addresses = parseAddrs((e.target as HTMLInputElement).value))}
+              />
+            </label>
+            <label class="df-field">
+              <span>件名</span>
+              <input type="text" bind:value={selectedDraft.subject} />
+            </label>
+            <label class="df-field df-body">
+              <span>本文</span>
+              <textarea rows="18" bind:value={selectedDraft.body_text}></textarea>
+            </label>
+            <div class="df-actions">
+              <button onclick={discardSelectedDraft}>破棄</button>
+              <button onclick={saveSelectedDraft}>保存</button>
+              <button class="primary" onclick={sendSelectedDraft} disabled={draftSending}>
+                {draftSending ? "送信中…" : "▶ 送信"}
+              </button>
+            </div>
+          {:else}
+            <p class="empty">下書きを選択してください</p>
+          {/if}
+        </div>
+      </div>
+    {:else if !selectedThreadId && !compose}
       <p class="empty">スレッドを選択してください</p>
-    {:else if compose}
+    {:else}
+      {#if selectedThreadId}
+        {@const tid = selectedThreadId}
+        {@const saving = threadCommentSaving[tid] ?? false}
+        {@const draft = threadCommentDraft[tid] ?? ""}
+        <!-- ===== スレッド横断 社内メモ (compose 中も常時表示) ===== -->
+        <div class="thread-memo" role="region" aria-label="社内メモ">
+          <div class="comments-head">
+            <span class="comments-title">💬 社内メモ</span>
+            {#if threadComments.length > 0}
+              <span class="comments-count">{threadComments.length} 件</span>
+            {/if}
+            <span class="comments-hint">このメモはメール送信されません</span>
+          </div>
+          {#if threadComments.length === 0}
+            <p class="comments-empty">まだメモはありません</p>
+          {:else}
+            <ul class="comment-list">
+              {#each threadComments as c (c.id)}
+                <li class="comment" class:own={c.author_id === userId}>
+                  <div class="comment-meta">
+                    <strong>{commentAuthorLabel(c)}</strong>
+                    <span class="comment-time">{formatCommentTime(c.created_at)}</span>
+                    {#if c.author_id === userId}
+                      <button
+                        class="comment-del"
+                        title="削除"
+                        onclick={() => void deleteComment(c)}
+                      >✕</button>
+                    {/if}
+                  </div>
+                  <pre class="comment-body">{c.body}</pre>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          <div class="comment-input">
+            <textarea
+              rows="2"
+              placeholder="例: 明日ひかるさんが返信予定 / 要確認: 請求内容"
+              value={draft}
+              oninput={(e) => (threadCommentDraft = { ...threadCommentDraft, [tid]: (e.currentTarget as HTMLTextAreaElement).value })}
+              onkeydown={(e) => {
+                if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                  e.preventDefault();
+                  void addThreadComment(tid);
+                }
+              }}
+            ></textarea>
+            <button
+              class="primary"
+              disabled={saving || !draft.trim()}
+              onclick={() => void addThreadComment(tid)}
+            >
+              {saving ? "投稿中…" : "投稿 (⌘/Ctrl+Enter)"}
+            </button>
+          </div>
+        </div>
+      {/if}
+      {#if compose}
       {@const composeAcct = accounts.find((a) => {
         const src = messages.find((m) => m.id === compose!.sourceMessageId);
         return a.id === src?.account_id;
@@ -1602,69 +1868,9 @@
             <pre>{m.body_text ?? ""}</pre>
           {/if}
 
-          <!-- 社内コメント (メール本体には送信されない) -->
-          <!-- 親 .message (role=button) の click/keydown が markRead を発火するのを止めるためのラッパ -->
-          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-          <div
-            class="comments"
-            role="region"
-            aria-label="社内メモ"
-            onclick={(e) => e.stopPropagation()}
-            onkeydown={(e) => e.stopPropagation()}
-          >
-            <div class="comments-head">
-              <span class="comments-title">💬 社内メモ</span>
-              {#if (commentsByMessage[m.id] ?? []).length > 0}
-                <span class="comments-count">{(commentsByMessage[m.id] ?? []).length} 件</span>
-              {/if}
-              <span class="comments-hint">このメモはメール送信されません</span>
-            </div>
-            {#if (commentsByMessage[m.id] ?? []).length === 0}
-              <p class="comments-empty">まだコメントはありません</p>
-            {:else}
-              <ul class="comment-list">
-                {#each commentsByMessage[m.id] ?? [] as c (c.id)}
-                  <li class="comment" class:own={c.author_id === userId}>
-                    <div class="comment-meta">
-                      <strong>{commentAuthorLabel(c)}</strong>
-                      <span class="comment-time">{formatCommentTime(c.created_at)}</span>
-                      {#if c.author_id === userId}
-                        <button
-                          class="comment-del"
-                          title="削除"
-                          onclick={(e) => { e.stopPropagation(); void deleteComment(c); }}
-                        >✕</button>
-                      {/if}
-                    </div>
-                    <pre class="comment-body">{c.body}</pre>
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-            <div class="comment-input" role="presentation" onclick={(e) => e.stopPropagation()}>
-              <textarea
-                rows="2"
-                placeholder="例: 明日ひかるさんが返信予定 / 要確認: 請求内容"
-                value={commentDraft[m.id] ?? ""}
-                oninput={(e) => (commentDraft = { ...commentDraft, [m.id]: (e.currentTarget as HTMLTextAreaElement).value })}
-                onkeydown={(e) => {
-                  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-                    e.preventDefault();
-                    void addComment(m.id);
-                  }
-                }}
-              ></textarea>
-              <button
-                class="primary"
-                disabled={commentSaving[m.id] || !((commentDraft[m.id] ?? "").trim())}
-                onclick={(e) => { e.stopPropagation(); void addComment(m.id); }}
-              >
-                {commentSaving[m.id] ? "投稿中…" : "投稿 (⌘/Ctrl+Enter)"}
-              </button>
-            </div>
-          </div>
         </div>
       {/each}
+    {/if}
     {/if}
   </section>
 </div>
@@ -2586,14 +2792,6 @@
     font-weight: 600;
     vertical-align: middle;
   }
-  .comments {
-    margin-top: 1rem;
-    padding-top: 0.75rem;
-    border-top: 1px dashed #d1d5db;
-    background: #fffbeb;
-    border-radius: 6px;
-    padding: 0.75rem;
-  }
   .comments-head {
     display: flex;
     align-items: center;
@@ -2696,5 +2894,105 @@
     background: #9ca3af;
     border-color: #9ca3af;
     cursor: not-allowed;
+  }
+
+  /* スレッドヘッダに置く社内メモ (メッセージ横断で集約) */
+  .thread-memo {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    margin: 0;
+    background: #fffbeb;
+    border-bottom: 1px solid #fde68a;
+    padding: 0.6rem 1rem 0.75rem;
+  }
+  .thread-memo .comments-head { margin-bottom: 0.4rem; }
+  .thread-memo .comment-list { max-height: 20vh; overflow-y: auto; }
+
+  /* 下書きビュー */
+  .drafts-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid #e5e7eb;
+    background: #f9fafb;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  .drafts-header .back {
+    padding: 0.35rem 0.6rem;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .drafts-header .drafts-title { font-weight: 600; color: #374151; }
+  .drafts-layout {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    height: calc(100% - 3rem);
+  }
+  .drafts-list {
+    overflow-y: auto;
+    border-right: 1px solid #e5e7eb;
+    background: #fff;
+  }
+  .draft-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 0.7rem 0.9rem;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #f0f0f0;
+    cursor: pointer;
+  }
+  .draft-item:hover { background: #f9fafb; }
+  .draft-item.selected { background: #eff6ff; }
+  .draft-meta { display: flex; gap: 0.4rem; font-size: 0.72rem; color: #666; align-items: center; }
+  .draft-meta .ai { background: #fef3c7; color: #92400e; padding: 0.05rem 0.35rem; border-radius: 3px; }
+  .draft-date { margin-left: auto; }
+  .draft-subj { font-weight: 600; margin: 0.2rem 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .draft-to { font-size: 0.78rem; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .drafts-edit {
+    overflow-y: auto;
+    padding: 1rem 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+  .df-field { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.8rem; color: #374151; }
+  .df-field input,
+  .df-field textarea {
+    padding: 0.45rem 0.55rem;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.9rem;
+  }
+  .df-body textarea { resize: vertical; min-height: 18rem; }
+  .df-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
+  .df-actions button {
+    padding: 0.45rem 1.1rem;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    background: #f9fafb;
+    cursor: pointer;
+    font-size: 0.88rem;
+  }
+  .df-actions .primary {
+    background: #2563eb;
+    color: #fff;
+    border-color: #2563eb;
+  }
+  .df-actions .primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .ih-btn.selected {
+    background: #dbeafe;
+    border-color: #93c5fd;
+    color: #1d4ed8;
   }
 </style>
