@@ -16,6 +16,13 @@
     last_from_name?: string | null;
     last_from_address?: string | null;
   };
+  type Attachment = {
+    id: string;
+    filename: string;
+    content_type: string | null;
+    size_bytes: number | null;
+    storage_path: string | null;
+  };
   type Message = {
     id: string;
     account_id?: string;
@@ -30,6 +37,7 @@
     imap_uid: number | null;
     received_at: string;
     direction: string;
+    attachments?: Attachment[];
   };
   type Account = { id: string; label: string; is_shared: boolean; sort_order?: number; default_tone?: string; unread_count?: number };
   type Comment = {
@@ -642,8 +650,61 @@
       )
       .eq("thread_id", threadId)
       .order("received_at", { ascending: true });
-    messages = (data ?? []) as Message[];
+    const msgs = (data ?? []) as Message[];
+    if (msgs.length > 0) {
+      const ids = msgs.map((m) => m.id);
+      const { data: atts } = await mail
+        .from("attachments")
+        .select("id,message_id,filename,content_type,size_bytes,storage_path")
+        .in("message_id", ids);
+      const byMsg = new Map<string, Attachment[]>();
+      for (const a of (atts ?? []) as (Attachment & { message_id: string })[]) {
+        const list = byMsg.get(a.message_id) ?? [];
+        list.push({
+          id: a.id,
+          filename: a.filename,
+          content_type: a.content_type,
+          size_bytes: a.size_bytes,
+          storage_path: a.storage_path,
+        });
+        byMsg.set(a.message_id, list);
+      }
+      for (const m of msgs) m.attachments = byMsg.get(m.id) ?? [];
+    }
+    messages = msgs;
     await loadCommentsForOpenThread();
+  }
+
+  function formatBytes(n: number | null | undefined): string {
+    if (!n || n <= 0) return "";
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  let downloadingAttachmentId = $state<string | null>(null);
+  async function downloadAttachment(a: Attachment) {
+    if (!a.storage_path) { alert("保存先パスが無い添付です"); return; }
+    if (downloadingAttachmentId) return;
+    downloadingAttachmentId = a.id;
+    try {
+      const { data, error } = await supabase.storage
+        .from("mail-attachments")
+        .download(a.storage_path);
+      if (error || !data) throw error ?? new Error("download failed");
+      const url = URL.createObjectURL(data);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = a.filename || "attachment";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    } catch (e) {
+      alert(`ダウンロード失敗: ${(e as Error).message}`);
+    } finally {
+      downloadingAttachmentId = null;
+    }
   }
 
   async function openThread(t: Thread) {
@@ -1868,6 +1929,34 @@
             <pre>{m.body_text ?? ""}</pre>
           {/if}
 
+          {#if m.attachments && m.attachments.length > 0}
+            <div
+              class="attachments"
+              role="presentation"
+              onclick={(e) => e.stopPropagation()}
+              onkeydown={(e) => e.stopPropagation()}
+            >
+              <div class="attachments-title">📎 添付ファイル ({m.attachments.length})</div>
+              <ul>
+                {#each m.attachments as a}
+                  <li>
+                    <button
+                      class="attachment-btn"
+                      disabled={downloadingAttachmentId === a.id || !a.storage_path}
+                      onclick={() => downloadAttachment(a)}
+                      title={a.content_type ?? ""}
+                    >
+                      <span class="att-name">{a.filename}</span>
+                      {#if a.size_bytes}
+                        <span class="att-size">{formatBytes(a.size_bytes)}</span>
+                      {/if}
+                      <span class="att-dl">{downloadingAttachmentId === a.id ? "…" : "⬇"}</span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
         </div>
       {/each}
     {/if}
@@ -2398,6 +2487,53 @@
     color: #fff;
     border-color: #2563eb;
   }
+
+  .attachments {
+    margin-top: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+  }
+  .attachments-title {
+    font-size: 0.8rem;
+    color: #6b7280;
+    margin-bottom: 0.4rem;
+  }
+  .attachments ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .attachment-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    text-align: left;
+  }
+  .attachment-btn:hover:not(:disabled) {
+    border-color: #2563eb;
+    color: #2563eb;
+  }
+  .attachment-btn:disabled { opacity: 0.5; cursor: default; }
+  .att-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .att-size { color: #9ca3af; font-size: 0.75rem; }
+  .att-dl { color: #6b7280; }
 
   /* ===== Compose (inline reply/forward) ===== */
   .compose-header {

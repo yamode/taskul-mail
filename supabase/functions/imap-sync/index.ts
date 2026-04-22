@@ -12,6 +12,16 @@ import { simpleParser } from "npm:mailparser@3.6.9";
 import { Buffer } from "node:buffer";
 import { adminClient, readSecret } from "../_shared/vault.ts";
 import { handlePreflight, jsonResponse } from "../_shared/cors.ts";
+import { fetchSourceRawImap } from "../_shared/raw-imap.ts";
+
+const ATTACHMENTS_BUCKET = "mail-attachments";
+
+function safeFilename(name: string): string {
+  // Supabase Storage のキーとして安全な形に。日本語は保持、空白・記号の一部だけ除去。
+  return (name || "attachment")
+    .replace(/[\x00-\x1f\x7f/\\]/g, "_")
+    .slice(0, 180);
+}
 
 type AccountRow = {
   id: string;
@@ -23,51 +33,6 @@ type AccountRow = {
   last_uid: number;
   last_uidvalidity: number | null;
 };
-
-/** 生TLS で AUTHENTICATE PLAIN を試すプレチェック。imapflow を使わず直接プロトコルを話す。
- *  LOGIN コマンドで拒否されるが PLAIN SASL なら通るケース (パスワードに `}` を含む等) の切り分け用。 */
-async function rawAuthPlainProbe(
-  host: string,
-  port: number,
-  user: string,
-  pass: string,
-  log: string[],
-): Promise<"ok" | string> {
-  const conn = await Deno.connectTls({ hostname: host, port });
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const buf = new Uint8Array(16384);
-
-  const readChunk = async (): Promise<string> => {
-    const n = await conn.read(buf);
-    if (!n) return "";
-    return dec.decode(buf.subarray(0, n));
-  };
-
-  const write = async (s: string) => {
-    log.push(`PROBE>> ${s.replace(/\r\n/g, "\\r\\n")}`);
-    await conn.write(enc.encode(s));
-  };
-
-  try {
-    const greeting = await readChunk();
-    log.push(`PROBE<< ${greeting.trim()}`);
-
-    const payload = `\0${user}\0${pass}`;
-    const b64 = btoa(payload);
-    await write(`a1 AUTHENTICATE PLAIN ${b64}\r\n`);
-    const resp = await readChunk();
-    log.push(`PROBE<< ${resp.trim()}`);
-
-    await write(`a2 LOGOUT\r\n`);
-    try { await readChunk(); } catch { /* ignore */ }
-
-    if (/^a1 OK/m.test(resp)) return "ok";
-    return resp.trim();
-  } finally {
-    try { conn.close(); } catch { /* ignore */ }
-  }
-}
 
 function normalizeSubject(s: string | undefined): string {
   if (!s) return "";
@@ -89,55 +54,8 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
-/** 案A: 本文を UID FETCH BODY[] ではなく `download()` (IMAP 内部的には BODY.PEEK[]) で
- *  別コマンド扱いで取得する。`fetchOne({source:true})` が Courier 上で 1 通目の応答後に
- *  次の応答を待って永久停止する現象を回避するための主経路。 */
-async function downloadSource(client: ImapFlow, uid: number): Promise<Uint8Array> {
-  const dl = await client.download(String(uid), undefined, { uid: true });
-  if (!dl || !dl.content) throw new Error("download returned no content");
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for await (const chunk of dl.content as AsyncIterable<Uint8Array>) {
-    const b = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk as ArrayBuffer);
-    chunks.push(b);
-    total += b.byteLength;
-  }
-  if (total === 0) throw new Error("download returned empty stream");
-  const out = new Uint8Array(total);
-  let o = 0;
-  for (const c of chunks) { out.set(c, o); o += c.byteLength; }
-  return out;
-}
-
-/** 案D: 該当 UID だけのために新規接続を張って fetch する。
- *  既存セッションの FETCH 応答待ちで詰まっている場合でも、新しいソケットなら
- *  初回応答は返ってくるという経験則に基づく last resort。1 通あたり 2〜3 秒掛かる。 */
-async function fetchSourceViaReconnect(
-  account: AccountRow,
-  password: string,
-  uid: number,
-): Promise<Uint8Array | null> {
-  const client = new ImapFlow({
-    host: account.imap_host,
-    port: account.imap_port,
-    secure: true,
-    auth: { user: account.username, pass: password },
-    logger: false,
-  });
-  await client.connect();
-  const lock = await client.getMailboxLock("INBOX");
-  try {
-    const msg = await client.fetchOne(
-      String(uid),
-      { uid: true, source: true },
-      { uid: true },
-    );
-    return (msg as { source?: Uint8Array } | null)?.source ?? null;
-  } finally {
-    lock.release();
-    try { await client.logout(); } catch { /* ignore */ }
-  }
-}
+// 本文取得は ../_shared/raw-imap.ts の fetchSourceRawImap に一本化した。
+// imapflow の download() / fetchOne({source:true}) は Courier-IMAP 上で hang するため使わない。
 
 async function syncOneAccount(
   account: AccountRow,
@@ -311,27 +229,23 @@ async function syncOneAccount(
     diag.target_uid_count = targetUids.length;
 
     // 2 段フェッチ:
-    //   Phase 1: envelope + size + internalDate (15s) — 本文を含まないので軽量
-    //   Phase 2: size <= MAX_SOURCE_SIZE なら download() で本文取得 (45s)
-    //            超えていたら envelope-only、download が timeout したら案D (単発再接続) で再試行
-    //   どれも駄目なら envelope-only で挿入 (件名/送信者だけでも残す)
+    //   Phase 1: imapflow で envelope + size + internalDate を軽量取得 (15s)
+    //   Phase 2: 生 IMAP (Deno TLS + AUTHENTICATE PLAIN + UID FETCH BODY.PEEK[]) で本文取得 (60s)
+    //            imapflow の fetchOne({source:true}) / download() は Courier 上で hang するので使わない。
+    //   本文取得失敗時は envelope-only で挿入 (件名/送信者だけでも残す)。
     // 連続 envelope 失敗は接続異常の可能性が高いので 3 件で run を打ち切る。
-    // download() が一度でも失敗したら共有セッションが詰まっている可能性が高いので、
-    // 以降の UID は envelope の後いきなり案D (再接続) に回す (reconnectOnly)。
     const ENVELOPE_TIMEOUT_MS = 15_000;
-    const SOURCE_TIMEOUT_MS = 45_000;
-    const RECONNECT_TIMEOUT_MS = 30_000;
-    const MAX_SOURCE_SIZE = 20 * 1024 * 1024; // 20MB
+    const SOURCE_TIMEOUT_MS = 60_000;
+    const MAX_SOURCE_SIZE = 25 * 1024 * 1024; // 25MB
     const MAX_CONSECUTIVE_SKIPS = 3;
     const skippedUids: number[] = [];
-    let reconnectOnly = false;
-    let downloadUsed = 0;
-    let reconnectUsed = 0;
+    let rawFetchOk = 0;
+    let rawFetchFail = 0;
     const fetchIter = (async function* () {
       let consecutiveSkips = 0;
       for (let i = 0; i < targetUids.length; i++) {
         const uid = targetUids[i];
-        console.log(`[${account.email_address}] fetch ${i + 1}/${targetUids.length} uid=${uid} begin (reconnectOnly=${reconnectOnly})`);
+        console.log(`[${account.email_address}] fetch ${i + 1}/${targetUids.length} uid=${uid} begin`);
 
         // Phase 1: envelope (fast)
         let meta: Record<string, unknown> | null = null;
@@ -366,47 +280,26 @@ async function syncOneAccount(
         const msgSize = Number((meta as { size?: unknown }).size ?? 0);
         console.log(`[${account.email_address}] fetch ${i + 1}/${targetUids.length} uid=${uid} envelope ok size=${msgSize}`);
 
-        // Phase 2: body source
+        // Phase 2: 生 IMAP で本文取得
         if (msgSize > MAX_SOURCE_SIZE) {
-          console.warn(`[${account.email_address}] uid=${uid} size=${msgSize} exceeds ${MAX_SOURCE_SIZE} — using envelope-only`);
-        } else if (msgSize > 0) {
-          let source: Uint8Array | null = null;
-
-          // 案A: download() でストリーミング取得
-          if (!reconnectOnly) {
-            try {
-              source = await withTimeout(
-                downloadSource(client, uid),
-                SOURCE_TIMEOUT_MS,
-                `download_timeout uid=${uid}`,
-              );
-              downloadUsed++;
-              console.log(`[${account.email_address}] download uid=${uid} ok bytes=${source.byteLength}`);
-            } catch (e) {
-              console.warn(`[${account.email_address}] download uid=${uid} FAILED: ${(e as Error).message} — falling back to reconnect`);
-              // この後は共有セッションが使えない可能性が高いので reconnect 経路に固定
-              reconnectOnly = true;
-            }
+          console.warn(`[${account.email_address}] uid=${uid} size=${msgSize} exceeds ${MAX_SOURCE_SIZE} — envelope-only`);
+        } else {
+          try {
+            const source = await fetchSourceRawImap({
+              host: account.imap_host,
+              port: account.imap_port,
+              user: account.username,
+              pass: password,
+              uid,
+              timeoutMs: SOURCE_TIMEOUT_MS,
+            });
+            (meta as { source?: Uint8Array }).source = source;
+            rawFetchOk++;
+            console.log(`[${account.email_address}] raw-imap uid=${uid} ok bytes=${source.byteLength}`);
+          } catch (e) {
+            rawFetchFail++;
+            console.warn(`[${account.email_address}] raw-imap uid=${uid} FAILED: ${(e as Error).message} — envelope-only`);
           }
-
-          // 案D: 単発再接続
-          if (!source) {
-            try {
-              source = await withTimeout(
-                fetchSourceViaReconnect(account, password, uid),
-                RECONNECT_TIMEOUT_MS,
-                `reconnect_timeout uid=${uid}`,
-              );
-              if (source) {
-                reconnectUsed++;
-                console.log(`[${account.email_address}] reconnect uid=${uid} ok bytes=${source.byteLength}`);
-              }
-            } catch (e) {
-              console.warn(`[${account.email_address}] reconnect uid=${uid} FAILED: ${(e as Error).message} — envelope-only`);
-            }
-          }
-
-          if (source) (meta as { source?: Uint8Array }).source = source;
         }
 
         consecutiveSkips = 0;
@@ -538,7 +431,7 @@ async function syncOneAccount(
 
       console.log(`[${account.email_address}] thread resolved uid=${msg.uid}`);
       // メッセージ insert (重複は account_id+imap_uid の unique で弾く)
-      const { error: mErr } = await sb.from("messages").upsert(
+      const { data: upsertedMsg, error: mErr } = await sb.from("messages").upsert(
         {
           account_id: account.id,
           thread_id: threadId,
@@ -560,12 +453,69 @@ async function syncOneAccount(
           raw_headers: {},
         },
         { onConflict: "account_id,imap_uid" },
-      );
+      ).select("id").single();
       if (mErr) {
         console.error(`[${account.email_address}] message insert failed uid=${msg.uid}`, mErr);
         continue;
       }
-      console.log(`[${account.email_address}] upserted uid=${msg.uid}`);
+      const messageUuid = (upsertedMsg as { id: string } | null)?.id;
+      console.log(`[${account.email_address}] upserted uid=${msg.uid} id=${messageUuid}`);
+
+      // 添付ファイルを Storage にアップロードして mail.attachments へ登録。
+      // 失敗してもメール本体の取得は成功扱いのまま (添付だけ欠落)。
+      if (messageUuid && Array.isArray(parsed.attachments) && parsed.attachments.length > 0) {
+        // 同じ UID の再同期時に重複しないよう既存レコードは全消しして入れ直す
+        const { data: oldRows } = await sb
+          .from("attachments")
+          .select("id,storage_path")
+          .eq("message_id", messageUuid);
+        if (oldRows && oldRows.length > 0) {
+          const paths = (oldRows as { storage_path: string | null }[])
+            .map((r) => r.storage_path)
+            .filter((p): p is string => !!p);
+          if (paths.length > 0) {
+            try { await sb.storage.from(ATTACHMENTS_BUCKET).remove(paths); } catch { /* ignore */ }
+          }
+          await sb.from("attachments").delete().eq("message_id", messageUuid);
+        }
+
+        for (const att of parsed.attachments as Array<{
+          filename?: string;
+          contentType?: string;
+          size?: number;
+          content?: Uint8Array | Buffer;
+          cid?: string;
+        }>) {
+          const filename = att.filename || "attachment";
+          const content = att.content;
+          if (!content) continue;
+          const buf = content instanceof Uint8Array && !(content instanceof Buffer)
+            ? content
+            : new Uint8Array((content as Buffer).buffer, (content as Buffer).byteOffset, (content as Buffer).byteLength);
+          const storagePath = `${account.id}/${messageUuid}/${crypto.randomUUID()}-${safeFilename(filename)}`;
+          const { error: upErr } = await sb.storage
+            .from(ATTACHMENTS_BUCKET)
+            .upload(storagePath, buf, {
+              contentType: att.contentType || "application/octet-stream",
+              upsert: false,
+            });
+          if (upErr) {
+            console.warn(`[${account.email_address}] attachment upload failed uid=${msg.uid} name=${filename}: ${upErr.message}`);
+            continue;
+          }
+          const { error: aErr } = await sb.from("attachments").insert({
+            message_id: messageUuid,
+            filename,
+            content_type: att.contentType ?? null,
+            size_bytes: att.size ?? buf.byteLength,
+            storage_path: storagePath,
+            content_id: att.cid ?? null,
+          });
+          if (aErr) {
+            console.warn(`[${account.email_address}] attachment row insert failed uid=${msg.uid} name=${filename}: ${aErr.message}`);
+          }
+        }
+      }
 
       // last_message_at のみ更新 (件数集計は最後にまとめて)
       touchedThreads.set(threadId!, (parsed.date ?? new Date()).toISOString());
@@ -627,11 +577,10 @@ async function syncOneAccount(
     diag.processed = processed;
     diag.hit_limit = processed >= MAX_PER_RUN;
     diag.max_seen_uid = maxSeenUid;
-    diag.download_used = downloadUsed;
-    diag.reconnect_used = reconnectUsed;
-    diag.reconnect_only = reconnectOnly;
+    diag.raw_fetch_ok = rawFetchOk;
+    diag.raw_fetch_fail = rawFetchFail;
     console.log(
-      `[${account.email_address}] DONE processed=${processed} maxSeenUid=${maxSeenUid} download=${downloadUsed} reconnect=${reconnectUsed}`,
+      `[${account.email_address}] DONE processed=${processed} maxSeenUid=${maxSeenUid} rawOk=${rawFetchOk} rawFail=${rawFetchFail}`,
     );
   } finally {
     lock.release();

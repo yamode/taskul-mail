@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.11.0",
+    date: "2026-04-22",
+    changes: [
+      "本文取得を生 IMAP (Deno TLS + AUTHENTICATE PLAIN + UID FETCH BODY.PEEK[]) に一本化。imapflow の download() / fetchOne({source:true}) が Courier-IMAP 上で hang する問題を根本解決。「本文取得失敗」プレースホルダーの発生源を解消",
+      "添付ファイル対応: 受信時に Supabase Storage (mail-attachments バケット) へアップロード、mail.attachments に登録、メッセージ詳細の末尾に一覧表示しクリックでダウンロード",
+      "SASL-IR PLAIN 認証に切替えたことで、Courier の LOGIN コマンドで拒否されていたアカウント (パスワードに `}` を含むケース等) も同期可能に",
+    ],
+  },
+  {
     version: "0.10.0",
     date: "2026-04-22",
     changes: [
