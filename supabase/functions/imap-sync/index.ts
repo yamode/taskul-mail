@@ -83,10 +83,10 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
   const password = await readSecret(sb, account.password_secret_id);
 
   const diag: Record<string, unknown> = {
-    user_len: account.username.length,
-    user_codes: [...account.username].map((c) => c.charCodeAt(0)),
-    pass_len: password.length,
-    pass_codes: [...password].map((c) => c.charCodeAt(0)),
+    account_last_uid: account.last_uid,
+    account_last_uid_type: typeof account.last_uid,
+    account_last_uidvalidity: account.last_uidvalidity,
+    account_last_uidvalidity_type: typeof account.last_uidvalidity,
     imap_logs: [] as string[],
   };
   const imapLogs = diag.imap_logs as string[];
@@ -116,40 +116,73 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     const mailbox = client.mailbox;
     if (typeof mailbox === "boolean") throw new Error("mailbox not open");
 
+    // bigint で返ってくる可能性があるので Number に正規化
+    const serverUidValidity = Number(mailbox.uidValidity);
+    const storedLastUid = Number(account.last_uid ?? 0);
+    const storedUidValidity = account.last_uidvalidity === null || account.last_uidvalidity === undefined
+      ? null
+      : Number(account.last_uidvalidity);
+
+    diag.server_uidvalidity = serverUidValidity;
+    diag.stored_last_uid = storedLastUid;
+    diag.stored_uidvalidity = storedUidValidity;
+
     // UIDVALIDITY 変化検知
-    let fromUid = account.last_uid + 1;
-    if (
-      account.last_uidvalidity !== null &&
-      Number(mailbox.uidValidity) !== account.last_uidvalidity
-    ) {
+    let fromUid = storedLastUid + 1;
+    let effectiveLastUid = storedLastUid;
+    if (storedUidValidity !== null && serverUidValidity !== storedUidValidity) {
       console.warn(`UIDVALIDITY changed for ${account.email_address}, resetting`);
       fromUid = 1;
+      effectiveLastUid = 0;
     }
+
+    // Courier など UIDNEXT を SELECT に返さないサーバ向けに STATUS で取りに行く。
+    // STATUS はサーバによっては selected mailbox に対して動かないが、Courier は動く。
+    let uidNext = Number((mailbox as { uidNext?: number }).uidNext ?? 0);
+    if (!uidNext || Number.isNaN(uidNext)) {
+      try {
+        const status = await client.status("INBOX", { uidNext: true });
+        uidNext = Number(status.uidNext ?? 0);
+      } catch (e) {
+        imapLogs.push(`WARN  status failed: ${(e as Error).message}`);
+      }
+    }
+    const currentMaxUid = uidNext > 0
+      ? uidNext - 1
+      : Number((mailbox as { exists?: number }).exists ?? 0); // 最終手段: seqNo == uid 想定
 
     // 初回同期 (last_uid=0) は直近 100 件から。全件遡ると Edge Function が時間切れで落ちる。
-    const currentMaxUid = Number((mailbox as { uidNext?: number }).uidNext ?? 1) - 1;
-    if (account.last_uid === 0 && currentMaxUid > 100) {
+    if (effectiveLastUid === 0 && currentMaxUid > 100) {
       fromUid = currentMaxUid - 99;
     }
+    diag.uidnext = uidNext;
+    diag.from_uid = fromUid;
+    diag.current_max_uid = currentMaxUid;
 
     // 1 回の呼び出しで処理する上限。超えた分は次回の tick で続きを取る。
-    const MAX_PER_RUN = 200;
+    // wall clock 時間切れを避けるため、UID 範囲を明示的に区切る。
+    const MAX_PER_RUN = 30;
+    const toUid = Math.min(currentMaxUid, fromUid + MAX_PER_RUN - 1);
     let processed = 0;
-    let hitLimit = false;
+    let hitLimit = currentMaxUid > toUid;
 
-    let maxSeenUid = account.last_uid;
+    let maxSeenUid = effectiveLastUid;
     const touchedThreads = new Map<string, string>();
 
+    diag.to_uid = toUid;
+    const shouldFetch = currentMaxUid >= fromUid;
+    diag.should_fetch = shouldFetch;
+
     // 差分フェッチ (source は本文込み)
-    for await (const msg of client.fetch(
-      `${fromUid}:*`,
-      { uid: true, envelope: true, source: true, internalDate: true },
-      { uid: true },
-    )) {
-      if (processed >= MAX_PER_RUN) {
-        hitLimit = true;
-        break;
-      }
+    const fetchIter = shouldFetch
+      ? client.fetch(
+          `${fromUid}:${toUid}`,
+          { uid: true, envelope: true, source: true, internalDate: true },
+          { uid: true },
+        )
+      : (async function* () {})();
+
+    for await (const msg of fetchIter) {
       processed++;
       if (!msg.source) continue;
       const parsed = await simpleParser(msg.source);
@@ -260,6 +293,12 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       touchedThreads.set(threadId!, (parsed.date ?? new Date()).toISOString());
 
       if (Number(msg.uid) > maxSeenUid) maxSeenUid = Number(msg.uid);
+    }
+
+    // フェッチ範囲を完走したら last_uid を toUid まで進める。
+    // UID に欠番 (削除済み) がある場合に同じ範囲を再フェッチし続けるのを防ぐ。
+    if (shouldFetch && toUid > maxSeenUid) {
+      maxSeenUid = toUid;
     }
 
     // 触ったスレッドの message_count と last_message_at をまとめて更新
