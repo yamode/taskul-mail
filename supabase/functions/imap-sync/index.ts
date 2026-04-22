@@ -9,6 +9,7 @@
 
 import { ImapFlow } from "npm:imapflow@1.3.2";
 import { simpleParser } from "npm:mailparser@3.6.9";
+import { Buffer } from "node:buffer";
 import { adminClient, readSecret } from "../_shared/vault.ts";
 import { handlePreflight, jsonResponse } from "../_shared/cors.ts";
 
@@ -138,7 +139,10 @@ async function fetchSourceViaReconnect(
   }
 }
 
-async function syncOneAccount(account: AccountRow): Promise<Record<string, unknown>> {
+async function syncOneAccount(
+  account: AccountRow,
+  forceUid: number | null = null,
+): Promise<Record<string, unknown>> {
   const sb = adminClient();
   const password = await readSecret(sb, account.password_secret_id);
 
@@ -147,6 +151,7 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     account_last_uid_type: typeof account.last_uid,
     account_last_uidvalidity: account.last_uidvalidity,
     account_last_uidvalidity_type: typeof account.last_uidvalidity,
+    force_uid: forceUid,
     imap_logs: [] as string[],
   };
   const imapLogs = diag.imap_logs as string[];
@@ -264,10 +269,15 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     // 全モードで「対象 UID リストを先に確定 → fetchOne で 1 件ずつ取得」方式にする。
     // 以前の range fetch (例: 182601:182680) は imapflow の iterator が
     // 1 件目 upsert 後に次の FETCH 応答を待って永久停止するサーバ挙動で詰まるため。
-    let mode: "first" | "forward" | "backfill" | "idle";
+    let mode: "first" | "forward" | "backfill" | "idle" | "refetch";
     let targetUids: number[] = [];
 
-    if (effectiveLastUid === 0 && oldestSyncedUid === null) {
+    if (forceUid !== null) {
+      // 手動再取得: 指定 UID だけを再フェッチ (既存行を upsert で上書き)
+      mode = "refetch";
+      targetUids = [forceUid];
+      console.log(`[${account.email_address}] REFETCH uid=${forceUid}`);
+    } else if (effectiveLastUid === 0 && oldestSyncedUid === null) {
       // first モードも SEARCH + fetchOne に統一 (range fetch の hang を回避)
       mode = "first";
       if (allUidsCached.length > 0) {
@@ -414,7 +424,13 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       // deno-lint-ignore no-explicit-any
       let parsed: any;
       if (msg.source) {
-        parsed = await simpleParser(msg.source);
+        // mailparser@3.6.9 は Buffer/string/Readable のみ受け付けるため、
+        // download() / fetchOne で返ってくる Uint8Array は Buffer へ包み直す。
+        // (素の Uint8Array を渡すと "input.once is not a function" で落ちる)
+        const src = msg.source instanceof Uint8Array && !(msg.source instanceof Buffer)
+          ? Buffer.from(msg.source.buffer, msg.source.byteOffset, msg.source.byteLength)
+          : msg.source;
+        parsed = await simpleParser(src);
         console.log(`[${account.email_address}] parsed uid=${msg.uid}`);
       } else if (msg.envelope) {
         const env = msg.envelope as {
@@ -570,7 +586,8 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     // スキップした UID も maxSeenUid に反映 (forward / first モード)。
     // こうしないと next run で同じ UID を再試行して永久ループするため。
     // backfill モードは oldestSyncedUid より古い UID なので last_uid には影響させない。
-    if (mode !== "backfill" && skippedUids.length > 0) {
+    // refetch モードも last_uid を動かさない (単発再取得なので既存状態を保つ)。
+    if (mode !== "backfill" && mode !== "refetch" && skippedUids.length > 0) {
       const maxSkipped = Math.max(...skippedUids);
       if (maxSkipped > maxSeenUid) {
         console.warn(`[${account.email_address}] advancing maxSeenUid past skipped UIDs: ${maxSeenUid} -> ${maxSkipped}`);
@@ -590,15 +607,22 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
         .eq("id", tid);
     }
 
-    // アカウントの同期ステート更新
-    await sb
-      .from("accounts")
-      .update({
-        last_uid: maxSeenUid,
-        last_uidvalidity: Number(mailbox.uidValidity),
-        last_synced_at: new Date().toISOString(),
-      })
-      .eq("id", account.id);
+    // アカウントの同期ステート更新 (refetch モードは last_uid を触らない)
+    if (mode === "refetch") {
+      await sb
+        .from("accounts")
+        .update({ last_synced_at: new Date().toISOString() })
+        .eq("id", account.id);
+    } else {
+      await sb
+        .from("accounts")
+        .update({
+          last_uid: maxSeenUid,
+          last_uidvalidity: Number(mailbox.uidValidity),
+          last_synced_at: new Date().toISOString(),
+        })
+        .eq("id", account.id);
+    }
 
     diag.processed = processed;
     diag.hit_limit = processed >= MAX_PER_RUN;
@@ -621,9 +645,20 @@ Deno.serve(async (req) => {
   const pre = handlePreflight(req);
   if (pre) return pre;
 
-  // 単発アカウント指定 or 全件
+  // 単発アカウント指定 or 全件。force_uid=<N> 指定時はその UID だけ再取得する。
   const url = new URL(req.url);
   const accountId = url.searchParams.get("account_id");
+  const forceUidParam = url.searchParams.get("force_uid");
+  const forceUid = forceUidParam !== null ? Number(forceUidParam) : null;
+
+  if (forceUid !== null) {
+    if (!accountId) {
+      return jsonResponse(req, { error: "force_uid requires account_id" }, 400);
+    }
+    if (!Number.isFinite(forceUid) || forceUid <= 0) {
+      return jsonResponse(req, { error: "force_uid must be a positive integer" }, 400);
+    }
+  }
 
   const sb = adminClient();
   const q = sb
@@ -644,7 +679,7 @@ Deno.serve(async (req) => {
   await Promise.all(
     ((accounts ?? []) as AccountRow[]).map(async (acc) => {
       try {
-        const diag = await syncOneAccount(acc);
+        const diag = await syncOneAccount(acc, forceUid);
         results[acc.email_address] = { status: "ok", diag };
       } catch (e) {
         const err = e as Error & {

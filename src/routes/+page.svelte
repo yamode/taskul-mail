@@ -1,6 +1,7 @@
 <script lang="ts">
   import { supabase, mail, fnUrl, authHeader } from "$lib/supabase";
   import { onMount, onDestroy } from "svelte";
+  import MailHtmlView from "$lib/components/MailHtmlView.svelte";
 
   type Thread = {
     id: string;
@@ -23,6 +24,8 @@
     cc_addresses?: string[];
     subject: string | null;
     body_text: string | null;
+    body_html: string | null;
+    imap_uid: number | null;
     received_at: string;
     direction: string;
   };
@@ -66,6 +69,36 @@
   let userEmail = $state<string | null>(null);
   let userDisplayName = $state<string | null>(null);
   let hoverThreadId = $state<string | null>(null);
+
+  // メッセージごとの本文表示モード (html / text) と、本文再取得の進行状況
+  //   デフォルトは body_html があれば html、無ければ text
+  let viewModeByMessage = $state<Record<string, "html" | "text">>({});
+  let refetchingByMessage = $state<Record<string, boolean>>({});
+
+  function bodyIsPlaceholder(m: Message): boolean {
+    return !!m.body_text && m.body_text.startsWith("[本文取得失敗");
+  }
+
+  async function refetchMessageBody(m: Message) {
+    if (!m.account_id || m.imap_uid == null) {
+      alert("再取得に必要な情報 (account_id / imap_uid) が欠けています");
+      return;
+    }
+    if (refetchingByMessage[m.id]) return;
+    refetchingByMessage = { ...refetchingByMessage, [m.id]: true };
+    try {
+      const res = await fetch(
+        fnUrl("imap-sync", { account_id: m.account_id, force_uid: String(m.imap_uid) }),
+        { method: "POST", headers: await authHeader() },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (selectedThreadId) await loadMessages(selectedThreadId);
+    } catch (e) {
+      alert(`再取得失敗: ${(e as Error).message}`);
+    } finally {
+      refetchingByMessage = { ...refetchingByMessage, [m.id]: false };
+    }
+  }
 
   // コメント (社内メモ)
   //   - メッセージ単位で持つ: commentsByMessage[message_id] = Comment[]
@@ -575,7 +608,7 @@
     const { data } = await mail
       .from("messages")
       .select(
-        "id,account_id,thread_id,from_address,from_name,to_addresses,cc_addresses,subject,body_text,received_at,direction",
+        "id,account_id,thread_id,from_address,from_name,to_addresses,cc_addresses,subject,body_text,body_html,imap_uid,received_at,direction",
       )
       .eq("thread_id", threadId)
       .order("received_at", { ascending: true });
@@ -1491,7 +1524,50 @@
             <span>{new Date(m.received_at).toLocaleString("ja-JP")}</span>
           </header>
           <h3>{m.subject ?? ""}</h3>
-          <pre>{m.body_text ?? ""}</pre>
+
+          {#if bodyIsPlaceholder(m)}
+            <!-- envelope-only フォールバックのプレースホルダー。手動再取得できるようにする -->
+            <div
+              class="body-placeholder"
+              role="presentation"
+              onclick={(e) => e.stopPropagation()}
+              onkeydown={(e) => e.stopPropagation()}
+            >
+              <p>{m.body_text}</p>
+              <button
+                class="refetch-btn"
+                disabled={refetchingByMessage[m.id] || m.imap_uid == null}
+                onclick={() => refetchMessageBody(m)}
+              >
+                {refetchingByMessage[m.id] ? "再取得中…" : "🔄 本文を再取得"}
+              </button>
+            </div>
+          {:else if m.body_html}
+            {@const mode = viewModeByMessage[m.id] ?? "html"}
+            <!-- HTML / text 切替 (既定は HTML) -->
+            <div
+              class="body-mode-toggle"
+              role="presentation"
+              onclick={(e) => e.stopPropagation()}
+              onkeydown={(e) => e.stopPropagation()}
+            >
+              <button
+                class:active={mode === "html"}
+                onclick={() => (viewModeByMessage = { ...viewModeByMessage, [m.id]: "html" })}
+              >HTML</button>
+              <button
+                class:active={mode === "text"}
+                onclick={() => (viewModeByMessage = { ...viewModeByMessage, [m.id]: "text" })}
+              >テキスト</button>
+            </div>
+            {#if mode === "html"}
+              <MailHtmlView html={m.body_html} />
+            {:else}
+              <pre>{m.body_text ?? ""}</pre>
+            {/if}
+          {:else}
+            <pre>{m.body_text ?? ""}</pre>
+          {/if}
 
           <!-- 社内コメント (メール本体には送信されない) -->
           <!-- 親 .message (role=button) の click/keydown が markRead を発火するのを止めるためのラッパ -->
@@ -2038,6 +2114,49 @@
     margin: 0;
     font-size: 0.92rem;
     line-height: 1.6;
+  }
+
+  .body-placeholder {
+    border: 1px dashed #d1d5db;
+    background: #fafaf9;
+    border-radius: 4px;
+    padding: 0.75rem;
+    margin-top: 0.5rem;
+  }
+  .body-placeholder p {
+    color: #92400e;
+    font-size: 0.9rem;
+    margin: 0 0 0.5rem;
+  }
+  .refetch-btn {
+    padding: 0.35rem 0.75rem;
+    border: 1px solid #2563eb;
+    background: #fff;
+    color: #2563eb;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .refetch-btn:disabled { opacity: 0.5; cursor: default; }
+
+  .body-mode-toggle {
+    display: flex;
+    gap: 0.25rem;
+    margin: 0.25rem 0 0.5rem;
+  }
+  .body-mode-toggle button {
+    padding: 0.2rem 0.6rem;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: #6b7280;
+    border-radius: 3px;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  .body-mode-toggle button.active {
+    background: #2563eb;
+    color: #fff;
+    border-color: #2563eb;
   }
 
   /* ===== Compose (inline reply/forward) ===== */

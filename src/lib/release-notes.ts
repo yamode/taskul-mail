@@ -6,6 +6,16 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.9.0",
+    date: "2026-04-22",
+    changes: [
+      "HTMLメール本文の表示に対応: body_html がある場合は iframe (sandbox) で HTML をそのまま描画。HTML / テキストのトグルで切り替え可能",
+      "iframe は sandbox=\"allow-popups allow-popups-to-escape-sandbox allow-same-origin\" で JS 無効化、<base target=\"_blank\"> を注入して全リンクを新タブで開く。描画後はコンテンツ高さに自動フィット",
+      "「[本文取得失敗]」プレースホルダーのメールに「🔄 本文を再取得」ボタンを追加: 指定 UID だけをピンポイント再フェッチ (imap-sync に force_uid クエリ対応を追加)",
+      "**本文取得失敗が多発していた根本原因を修正**: imap-sync の simpleParser が Uint8Array を受け付けず \"input.once is not a function\" で本文パースに失敗していた (v0.8.5 の download() 経路導入以降)。Uint8Array を Buffer でラップしてから mailparser に渡すよう修正。今後の新着 HTMLメールは正しく本文取得できるようになる",
+    ],
+  },
+  {
     version: "0.8.6",
     date: "2026-04-22",
     changes: [
