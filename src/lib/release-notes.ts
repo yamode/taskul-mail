@@ -6,6 +6,13 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.2.4",
+    date: "2026-04-22",
+    changes: [
+      "imap-sync が WallClockTime でシャットダウンされるバグ修正: Courier-IMAP は selected mailbox への STATUS 命令でハングするため、代わりに EXISTS から末尾シーケンス番号の UID を fetch して取得する方式に変更",
+    ],
+  },
+  {
     version: "0.2.3",
     date: "2026-04-22",
     changes: [

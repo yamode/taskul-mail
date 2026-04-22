@@ -136,26 +136,26 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       effectiveLastUid = 0;
     }
 
-    // Courier など UIDNEXT を SELECT に返さないサーバ向けに STATUS で取りに行く。
-    // STATUS はサーバによっては selected mailbox に対して動かないが、Courier は動く。
+    // Courier は UIDNEXT を SELECT に返さず、selected mailbox への STATUS でハングするため、
+    // EXISTS (シーケンス件数) から最大シーケンス番号を取り、sequence 指定で UID を探る。
+    const exists = Number((mailbox as { exists?: number }).exists ?? 0);
+    diag.exists = exists;
+
     let uidNext = Number((mailbox as { uidNext?: number }).uidNext ?? 0);
-    if (!uidNext || Number.isNaN(uidNext)) {
-      try {
-        const status = await client.status("INBOX", { uidNext: true });
-        uidNext = Number(status.uidNext ?? 0);
-      } catch (e) {
-        imapLogs.push(`WARN  status failed: ${(e as Error).message}`);
+    let currentMaxUid = uidNext > 0 ? uidNext - 1 : 0;
+
+    // uidNext が取れてない場合は末尾メッセージの UID をシーケンス指定で取得
+    if (currentMaxUid === 0 && exists > 0) {
+      for await (const m of client.fetch(`${exists}:${exists}`, { uid: true }, { uid: false })) {
+        currentMaxUid = Number(m.uid);
       }
     }
-    const currentMaxUid = uidNext > 0
-      ? uidNext - 1
-      : Number((mailbox as { exists?: number }).exists ?? 0); // 最終手段: seqNo == uid 想定
+    diag.uidnext = uidNext;
 
     // 初回同期 (last_uid=0) は直近 100 件から。全件遡ると Edge Function が時間切れで落ちる。
     if (effectiveLastUid === 0 && currentMaxUid > 100) {
       fromUid = currentMaxUid - 99;
     }
-    diag.uidnext = uidNext;
     diag.from_uid = fromUid;
     diag.current_max_uid = currentMaxUid;
 
