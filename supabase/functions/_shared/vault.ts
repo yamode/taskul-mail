@@ -32,19 +32,16 @@ export async function createSecret(
   return data as string;
 }
 
-/** secret_id から平文を取得 (service_role 必須) */
+/** secret_id から平文を取得 (service_role 必須)
+ *  vault スキーマは PostgREST に露出していないため、mail.vault_read_secret RPC 経由で取る。 */
 export async function readSecret(
   sb: SupabaseClient,
   secretId: string,
 ): Promise<string> {
-  const { data, error } = await (sb as any)
-    .schema("vault")
-    .from("decrypted_secrets")
-    .select("decrypted_secret")
-    .eq("id", secretId)
-    .single();
+  const { data, error } = await sb.rpc("vault_read_secret", { p_id: secretId });
   if (error) throw new Error(`vault read failed: ${error.message}`);
-  return (data as { decrypted_secret: string }).decrypted_secret;
+  if (!data) throw new Error(`vault read failed: secret not found`);
+  return data as string;
 }
 
 /** シークレット更新 */

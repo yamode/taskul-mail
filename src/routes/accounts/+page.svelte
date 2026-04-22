@@ -8,6 +8,11 @@
     email_address: string;
     is_shared: boolean;
     last_synced_at: string | null;
+    imap_host: string;
+    imap_port: number;
+    smtp_host: string;
+    smtp_port: number;
+    username: string;
   };
 
   let accounts = $state<Account[]>([]);
@@ -39,9 +44,62 @@
   async function loadAccounts() {
     const { data } = await mail
       .from("accounts")
-      .select("id,label,email_address,is_shared,last_synced_at")
+      .select(
+        "id,label,email_address,is_shared,last_synced_at,imap_host,imap_port,smtp_host,smtp_port,username",
+      )
       .order("created_at");
     accounts = (data ?? []) as Account[];
+  }
+
+  // ---- 編集モーダル ----
+  let editing = $state<Account | null>(null);
+  let editPassword = $state("");
+  let editSaving = $state(false);
+
+  function openEdit(a: Account) {
+    editing = { ...a };
+    editPassword = "";
+  }
+  function closeEdit() {
+    editing = null;
+    editPassword = "";
+  }
+  async function saveEdit() {
+    if (!editing) return;
+    editSaving = true;
+    try {
+      // メタ情報の更新 (password 以外)
+      const { error: uErr } = await mail
+        .from("accounts")
+        .update({
+          label: editing.label,
+          email_address: editing.email_address,
+          username: editing.username,
+          imap_host: editing.imap_host,
+          imap_port: Number(editing.imap_port),
+          smtp_host: editing.smtp_host,
+          smtp_port: Number(editing.smtp_port),
+          is_shared: editing.is_shared,
+        })
+        .eq("id", editing.id);
+      if (uErr) throw uErr;
+
+      // パスワードが入力されていれば Vault 経由で更新
+      if (editPassword) {
+        const { error: pErr } = await supabase.functions.invoke(
+          "update-account-password",
+          { body: { account_id: editing.id, password: editPassword } },
+        );
+        if (pErr) throw pErr;
+      }
+
+      closeEdit();
+      await loadAccounts();
+    } catch (e) {
+      alert(`更新失敗: ${(e as Error).message}`);
+    } finally {
+      editSaving = false;
+    }
   }
 
   async function addAccount() {
@@ -102,6 +160,7 @@
           <td>{a.last_synced_at ? new Date(a.last_synced_at).toLocaleString("ja-JP") : "-"}</td>
           <td class="row-actions">
             <button onclick={() => syncNow(a.id)}>同期</button>
+            <button onclick={() => openEdit(a)}>編集</button>
             <button class="danger" onclick={() => deleteAccount(a.id, a.email_address)}>削除</button>
           </td>
         </tr>
@@ -161,6 +220,54 @@
   </p>
 </section>
 
+{#if editing}
+  <div class="modal-backdrop" role="presentation" onclick={closeEdit}>
+    <div class="modal" role="dialog" aria-modal="true" tabindex="-1"
+         onclick={(e) => e.stopPropagation()}
+         onkeydown={(e) => { if (e.key === "Escape") closeEdit(); }}>
+      <h3>アカウント編集</h3>
+      <label class="field">ラベル
+        <input bind:value={editing.label} />
+      </label>
+      <label class="field">メールアドレス
+        <input type="email" bind:value={editing.email_address} />
+      </label>
+      <label class="field">ユーザー名 (通常メールアドレスと同じ)
+        <input bind:value={editing.username} />
+      </label>
+      <label class="field">パスワード (変更する場合のみ入力)
+        <input type="password" bind:value={editPassword} placeholder="変更しない場合は空欄" />
+      </label>
+      <div class="row">
+        <label class="field grow">IMAP ホスト
+          <input bind:value={editing.imap_host} />
+        </label>
+        <label class="field port">ポート
+          <input type="number" bind:value={editing.imap_port} />
+        </label>
+      </div>
+      <div class="row">
+        <label class="field grow">SMTP ホスト
+          <input bind:value={editing.smtp_host} />
+        </label>
+        <label class="field port">ポート
+          <input type="number" bind:value={editing.smtp_port} />
+        </label>
+      </div>
+      <label class="checkbox">
+        <input type="checkbox" bind:checked={editing.is_shared} />
+        共有アカウント
+      </label>
+      <div class="modal-actions">
+        <button onclick={closeEdit}>キャンセル</button>
+        <button class="primary" onclick={saveEdit} disabled={editSaving}>
+          {editSaving ? "保存中..." : "保存"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   section { padding: 2rem; max-width: 800px; }
   table { width: 100%; border-collapse: collapse; margin-bottom: 2rem; background: #fff; }
@@ -201,4 +308,24 @@
   .row-actions button { padding: 0.25rem 0.5rem; font-size: 0.85rem; }
   .danger { background: #dc2626; color: #fff; border: none; cursor: pointer; border-radius: 3px; }
   .danger:hover { background: #b91c1c; }
+
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,.4);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1000;
+  }
+  .modal {
+    background: #fff; padding: 1.5rem; border-radius: 8px;
+    max-width: 520px; width: 90%;
+    display: flex; flex-direction: column; gap: 0.6rem;
+    max-height: 90vh; overflow-y: auto;
+  }
+  .modal h3 { margin: 0 0 0.5rem 0; }
+  .modal input {
+    padding: 0.4rem 0.5rem; border: 1px solid #d1d5db; border-radius: 4px;
+    font-size: 0.95rem;
+  }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.5rem; }
+  .modal-actions button { padding: 0.5rem 1rem; border: 1px solid #d1d5db; border-radius: 4px; background: #f9fafb; cursor: pointer; }
+  .primary { background: #2563eb !important; color: #fff !important; border: none !important; }
 </style>

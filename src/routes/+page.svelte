@@ -14,8 +14,12 @@
   };
   type Message = {
     id: string;
+    account_id?: string;
+    thread_id?: string | null;
     from_address: string | null;
     from_name: string | null;
+    to_addresses?: string[];
+    cc_addresses?: string[];
     subject: string | null;
     body_text: string | null;
     received_at: string;
@@ -101,7 +105,9 @@
     draft = null;
     const { data } = await mail
       .from("messages")
-      .select("id,from_address,from_name,subject,body_text,received_at,direction")
+      .select(
+        "id,account_id,thread_id,from_address,from_name,to_addresses,cc_addresses,subject,body_text,received_at,direction",
+      )
       .eq("thread_id", t.id)
       .order("received_at", { ascending: true });
     messages = (data ?? []) as Message[];
@@ -112,6 +118,43 @@
         markRead(last.id);
       }
     }
+  }
+
+  async function startManualReply(replyAll = false) {
+    if (!selectedMessageId) return;
+    const src = messages.find((m) => m.id === selectedMessageId);
+    if (!src || !src.account_id) return;
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+
+    const subject = src.subject?.match(/^\s*re\s*:/i) ? src.subject : `Re: ${src.subject ?? ""}`;
+    const to = src.from_address ? [src.from_address] : [];
+    const cc = replyAll
+      ? [...(src.to_addresses ?? []), ...(src.cc_addresses ?? [])]
+          .filter((a) => a && a !== src.from_address)
+      : [];
+    const quoted = (src.body_text ?? "")
+      .split("\n").map((l) => `> ${l}`).join("\n");
+    const body = `\n\n--- ${new Date(src.received_at).toLocaleString("ja-JP")} ${src.from_name ?? src.from_address ?? ""} さんが書きました ---\n${quoted}`;
+
+    const { data, error } = await mail
+      .from("drafts")
+      .insert({
+        account_id: src.account_id,
+        author_id: user.id,
+        in_reply_to_message_id: src.id,
+        thread_id: src.thread_id ?? null,
+        to_addresses: to,
+        cc_addresses: cc,
+        subject,
+        body_text: body,
+        generated_by_ai: false,
+        status: "draft",
+      })
+      .select("id,subject,body_text")
+      .single();
+    if (error) { alert(`下書き作成失敗: ${error.message}`); return; }
+    draft = { id: data!.id, subject: data!.subject ?? subject, body_text: data!.body_text ?? body };
   }
 
   async function generateDraft() {
@@ -246,15 +289,30 @@
       {/each}
 
       <div class="draft-panel">
-        <h3>返信下書き</h3>
-        <input
-          type="text"
-          placeholder="トーン指示 (例: 丁寧に、簡潔に、提案を含めて)"
-          bind:value={hint}
-        />
-        <button onclick={generateDraft} disabled={generating || !selectedMessageId}>
-          {generating ? "生成中..." : "Claude で下書き生成"}
-        </button>
+        <h3>返信</h3>
+        <div class="reply-buttons">
+          <button
+            class="primary"
+            onclick={() => startManualReply(false)}
+            disabled={!selectedMessageId}
+          >
+            返信
+          </button>
+          <button onclick={() => startManualReply(true)} disabled={!selectedMessageId}>
+            全員に返信
+          </button>
+        </div>
+        <details>
+          <summary>Claude で下書き生成</summary>
+          <input
+            type="text"
+            placeholder="トーン指示 (例: 丁寧に、簡潔に、提案を含めて)"
+            bind:value={hint}
+          />
+          <button onclick={generateDraft} disabled={generating || !selectedMessageId}>
+            {generating ? "生成中..." : "Claude で下書き生成"}
+          </button>
+        </details>
 
         {#if draft}
           <input type="text" bind:value={draft.subject} />
@@ -387,6 +445,12 @@
     gap: 0.5rem;
   }
   .draft-panel h3 { margin: 0; }
+  .reply-buttons { display: flex; gap: 0.5rem; }
+  .reply-buttons button { padding: 0.5rem 1rem; }
+  .draft-panel details { background: #f9fafb; padding: 0.5rem 0.75rem; border-radius: 4px; }
+  .draft-panel details summary { cursor: pointer; font-size: 0.85rem; color: #374151; }
+  .draft-panel details > input,
+  .draft-panel details > button { margin-top: 0.5rem; width: 100%; }
   .draft-panel input, .draft-panel textarea {
     padding: 0.5rem;
     border: 1px solid #d1d5db;
