@@ -6,6 +6,14 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.8.6",
+    date: "2026-04-22",
+    changes: [
+      "Mac トラックパッドの 2 本指スワイプ削除が発火しない問題を修正: v0.8.1 で全入力共通で閾値を -100px → -300px に引き上げた結果、trackpad の wheel deltaX 累積では 300px に届かず実質機能していなかった",
+      "pointer (タッチ/マウスドラッグ) は -300px を維持したまま、wheel 用に別途 -150px の閾値を導入 (threshold の半分) ",
+    ],
+  },
+  {
     version: "0.8.5",
     date: "2026-04-22",
     changes: [
