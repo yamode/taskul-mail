@@ -61,17 +61,46 @@
       : threads.filter((t) => t.account_id === filterAccountId),
   );
 
-  // 同期状態: imap-sync 呼び出し中かどうかと、最後に完了した時刻・エラー。
-  let syncing = $state(false);
-  let lastSyncedAt = $state<number | null>(null);
-  let syncError = $state<string | null>(null);
-  let nowTick = $state(Date.now()); // 相対時刻表示を 30 秒ごとに更新するためのトリガ
+  // 同期状態: アカウントごとに独立管理する。
+  // 1 つの遅い/ハングしたアカウントが他のアカウントの反映を待たせないようにする。
+  type AcctSync = { syncing: boolean; lastSyncedAt: number | null; error: string | null };
+  let acctSync = $state<Record<string, AcctSync>>({});
+  let nowTick = $state(Date.now());
 
   // "いま"の再計算用タイマ
   let clockTimer: ReturnType<typeof setInterval> | null = null;
   let syncTimer: ReturnType<typeof setInterval> | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let realtimeChannel: ReturnType<typeof supabase.channel> | null = null;
+
+  // 集計済みの同期状態 (derived)
+  let anySyncing = $derived(Object.values(acctSync).some((s) => s.syncing));
+  let syncProgress = $derived.by(() => {
+    const total = accounts.length;
+    if (total === 0) return { total: 0, done: 0, syncing: 0, errored: 0 };
+    let done = 0, syncing = 0, errored = 0;
+    for (const a of accounts) {
+      const s = acctSync[a.id];
+      if (!s) continue;
+      if (s.syncing) syncing++;
+      else if (s.error) errored++;
+      else if (s.lastSyncedAt) done++;
+    }
+    return { total, done, syncing, errored };
+  });
+  let oldestSyncedAt = $derived.by(() => {
+    void nowTick;
+    let min: number | null = null;
+    for (const a of accounts) {
+      const s = acctSync[a.id];
+      if (!s?.lastSyncedAt) return null; // 未同期のアカウントが 1 つでもあれば null
+      if (min === null || s.lastSyncedAt < min) min = s.lastSyncedAt;
+    }
+    return min;
+  });
+  let aggregateError = $derived(
+    accounts.map((a) => acctSync[a.id]?.error).find((e) => !!e) ?? null,
+  );
 
   // Gmail ライクなリアルタイム性:
   //   (a) Supabase Realtime で mail.messages INSERT を購読し、即座に反映
@@ -81,31 +110,42 @@
   const DB_POLL_INTERVAL = 15_000;
   const IMAP_SYNC_TIMEOUT = 45_000;
 
-  async function syncTick() {
-    if (typeof document !== "undefined" && document.hidden) return;
-    if (syncing) return;
-    syncing = true;
-    syncError = null;
+  function setAcctSync(id: string, patch: Partial<AcctSync>) {
+    const prev = acctSync[id] ?? { syncing: false, lastSyncedAt: null, error: null };
+    acctSync = { ...acctSync, [id]: { ...prev, ...patch } };
+  }
+
+  // アカウント 1 つだけ同期する。並列呼び出し前提。
+  async function syncOneAccount(accountId: string) {
+    if (acctSync[accountId]?.syncing) return;
+    setAcctSync(accountId, { syncing: true, error: null });
     const controller = new AbortController();
     const to = setTimeout(() => controller.abort(), IMAP_SYNC_TIMEOUT);
     try {
-      const res = await fetch(fnUrl("imap-sync"), {
+      const res = await fetch(fnUrl("imap-sync", { account_id: accountId }), {
         method: "POST",
         headers: await authHeader(),
         signal: controller.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      lastSyncedAt = Date.now();
+      setAcctSync(accountId, { syncing: false, lastSyncedAt: Date.now(), error: null });
+      // 完了ごとに threads を再読込 (他のアカウントを待たずに新着が反映される)
       await loadThreads();
       if (selectedThreadId) await loadMessages(selectedThreadId);
     } catch (e) {
-      // abort (timeout) もここに来る。UI は同期停止扱いにして次回 tick に任せる。
-      syncError = (e as Error).name === "AbortError" ? "タイムアウト" : (e as Error).message;
-      console.warn("sync tick failed", e);
+      const err = (e as Error).name === "AbortError" ? "タイムアウト" : (e as Error).message;
+      setAcctSync(accountId, { syncing: false, error: err });
+      console.warn(`sync failed for account ${accountId}`, e);
     } finally {
       clearTimeout(to);
-      syncing = false;
     }
+  }
+
+  // 全アカウントを並列で同期。既に syncing のアカウントはスキップ。
+  async function syncTick() {
+    if (typeof document !== "undefined" && document.hidden) return;
+    if (accounts.length === 0) return;
+    await Promise.all(accounts.map((a) => syncOneAccount(a.id)));
   }
 
   // 軽量 poll: threads テーブルを見て新着があれば UI 更新。
@@ -611,6 +651,7 @@
       <span class="account-label">すべて</span>
     </button>
     {#each accounts as a (a.id)}
+      {@const s = acctSync[a.id]}
       <button
         class="account"
         class:selected={filterAccountId === a.id}
@@ -626,6 +667,18 @@
           <span class="shared-badge" title="共有アカウント">共</span>
         {/if}
         <span class="account-label">{a.label}</span>
+        {#if s?.syncing}
+          <span class="acct-spin" title="同期中" aria-hidden="true"></span>
+        {:else if s?.error}
+          <span
+            class="acct-err"
+            title={`前回エラー: ${s.error} — クリックで再試行`}
+            role="button"
+            tabindex="0"
+            onclick={(e) => { e.stopPropagation(); void syncOneAccount(a.id); }}
+            onkeydown={(e) => { if (e.key === "Enter") { e.stopPropagation(); void syncOneAccount(a.id); } }}
+          >⚠</span>
+        {/if}
         {#if (a.unread_count ?? 0) > 0}
           <span class="account-unread">{a.unread_count}</span>
         {/if}
@@ -635,20 +688,22 @@
       <button
         class="reload"
         onclick={() => { void syncTick(); }}
-        disabled={syncing}
-        title={syncError ? `前回エラー: ${syncError}` : "IMAP 再同期"}
+        disabled={anySyncing}
+        title={aggregateError ? `エラーあり: ${aggregateError}` : "全アカウントを同期"}
       >
-        {#if syncing}
+        {#if anySyncing}
           <span class="spinner" aria-hidden="true"></span>
-          同期中…
-        {:else if syncError}
-          ⚠ {syncError} (再試行)
+          同期中… ({syncProgress.done}/{syncProgress.total})
+        {:else if aggregateError && syncProgress.errored === syncProgress.total}
+          ⚠ 全アカウント同期エラー
+        {:else if aggregateError}
+          ⚠ 一部エラー ({syncProgress.errored}件) — 再試行
         {:else}
-          ↻ 再同期
+          ↻ 全アカウント再同期
         {/if}
       </button>
-      <div class="sync-info" class:error={!!syncError}>
-        最終同期: {formatRelative(lastSyncedAt)}
+      <div class="sync-info" class:error={!!aggregateError}>
+        最終同期: {formatRelative(oldestSyncedAt)}
       </div>
     </div>
   </aside>
@@ -869,6 +924,22 @@
     background: #ef4444; color: #fff; font-size: 0.7rem; font-weight: 700;
     padding: 0.1rem 0.4rem; border-radius: 9px; min-width: 1.4rem; text-align: center;
   }
+  .acct-spin {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 2px solid #d1d5db;
+    border-top-color: #2563eb;
+    animation: spin 0.8s linear infinite;
+    flex-shrink: 0;
+  }
+  .acct-err {
+    color: #b45309;
+    font-size: 0.8rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .acct-err:hover { color: #92400e; }
   .accounts-footer { margin-top: auto; padding-top: 0.5rem; }
   .accounts-footer .reload {
     width: 100%;
