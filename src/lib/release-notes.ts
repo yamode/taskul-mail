@@ -6,6 +6,31 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.8.5",
+    date: "2026-04-22",
+    changes: [
+      "imap-sync を 2 段フェッチに変更: Phase 1 で envelope+size のみ取得 (15s)、Phase 2 で本文を取得 (45s)",
+      "20MB 超のメールは本文取得をスキップし envelope-only で挿入 (件名/送信者/日付は記録、body_text は「[本文取得失敗]」プレースホルダー)",
+      "本文取得がタイムアウトした場合も envelope-only で挿入するようフォールバック: hikaru.s@ のような添付が多い個人アドレスで本文 DL が 45s を超えても、少なくともメールの存在は同期される",
+    ],
+  },
+  {
+    version: "0.8.4",
+    date: "2026-04-22",
+    changes: [
+      "imap-sync の fetchOne タイムアウトを 15s → 45s に拡大: 個人アドレス (hikaru.s@ 等) の添付が大きいメールで source DL が間に合わず毎回 PERMANENT_SKIP されていた問題を緩和",
+      "MAX_CONSECUTIVE_SKIPS=3 と組み合わせて最悪 135s で中断するため Edge Function の wall clock 内に収まる",
+    ],
+  },
+  {
+    version: "0.8.3",
+    date: "2026-04-22",
+    changes: [
+      "imap-sync: first モードでもスキップした UID を last_uid に反映するよう修正 (従来は forward モードのみ。first で特定 UID がタイムアウトすると毎回同じ UID を再試行する無限ループが発生していた)",
+      "fetchOne が null/undefined を返すケース (タイムアウト後に接続が壊れて後続リクエストが応答しない) を明示的なスキップとして扱い、3連続で run を打ち切り",
+    ],
+  },
+  {
     version: "0.8.2",
     date: "2026-04-22",
     changes: [

@@ -240,14 +240,15 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     diag.mode = mode;
     diag.target_uid_count = targetUids.length;
 
-    // 全モードで SEARCH → fetchOne 統一 (range fetch は一切使わない)
-    // 個々の fetchOne に 15 秒タイムアウト、失敗時はスキップして次へ。
-    // 連続 3 件スキップしたら imapflow の状態が壊れた可能性が高いので打ち切り。
-    // スキップした UID は maxSeenUid に反映して last_uid を前進させる
-    // (そうしないと次回も同じ UID で失敗する無限ループに陥る)。
-    // 添付が大きいメール (数MB〜) だと 15s では source DL が間に合わず timeout するため 45s に拡大。
-    // MAX_CONSECUTIVE_SKIPS=3 と組み合わせて最悪 135s で中断するので Edge Function の wall clock 内に収まる。
-    const FETCH_TIMEOUT_MS = 45_000;
+    // 2 段フェッチ:
+    //   Phase 1: envelope + size + internalDate (15s) — 本文を含まないので軽量
+    //   Phase 2: size <= MAX_SOURCE_SIZE なら source (45s)、超えていたら envelope-only で挿入
+    //   Phase 2 が timeout した場合も envelope-only で挿入 (本文取得失敗でも件名/送信者は記録)
+    // 連続 envelope 失敗は接続異常の可能性が高いので 3 件で run を打ち切る。
+    // スキップした UID は maxSeenUid に反映して last_uid を前進させる。
+    const ENVELOPE_TIMEOUT_MS = 15_000;
+    const SOURCE_TIMEOUT_MS = 45_000;
+    const MAX_SOURCE_SIZE = 20 * 1024 * 1024; // 20MB
     const MAX_CONSECUTIVE_SKIPS = 3;
     const skippedUids: number[] = [];
     const fetchIter = (async function* () {
@@ -255,41 +256,65 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       for (let i = 0; i < targetUids.length; i++) {
         const uid = targetUids[i];
         console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} begin`);
+
+        // Phase 1: envelope (fast)
+        let meta: Record<string, unknown> | null = null;
         try {
-          const one = await Promise.race([
+          meta = await Promise.race([
             client.fetchOne(
               String(uid),
-              { uid: true, envelope: true, source: true, internalDate: true },
+              { uid: true, envelope: true, internalDate: true, size: true },
               { uid: true },
             ),
             new Promise<never>((_, rej) =>
-              setTimeout(() => rej(new Error(`fetchOne_timeout uid=${uid}`)), FETCH_TIMEOUT_MS),
+              setTimeout(() => rej(new Error(`envelope_timeout uid=${uid}`)), ENVELOPE_TIMEOUT_MS),
             ),
-          ]);
-          console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} end gotSrc=${!!(one as { source?: unknown })?.source}`);
-          // fetchOne が null/undefined を返す場合は接続が壊れている (タイムアウト後の後続リクエスト等)
-          if (!one) {
-            console.warn(`[${account.email_address}] fetchOne uid=${uid} returned null — treating as skip`);
-            skippedUids.push(uid);
-            consecutiveSkips++;
-            if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
-              console.warn(`[${account.email_address}] ${consecutiveSkips} consecutive skips — aborting this run`);
-              break;
-            }
-            continue;
-          }
-          consecutiveSkips = 0;
-          yield one as never;
+          ]) as Record<string, unknown> | null;
         } catch (e) {
-          console.warn(`[${account.email_address}] fetchOne uid=${uid} PERMANENT_SKIP: ${(e as Error).message}`);
+          console.warn(`[${account.email_address}] envelope fetch uid=${uid} FAILED: ${(e as Error).message}`);
           skippedUids.push(uid);
           consecutiveSkips++;
           if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
             console.warn(`[${account.email_address}] ${consecutiveSkips} consecutive skips — aborting this run`);
             break;
           }
-          // continue to next UID
+          continue;
         }
+        if (!meta) {
+          console.warn(`[${account.email_address}] envelope fetch uid=${uid} returned null`);
+          skippedUids.push(uid);
+          consecutiveSkips++;
+          if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) break;
+          continue;
+        }
+
+        const msgSize = Number((meta as { size?: unknown }).size ?? 0);
+        console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} envelope ok size=${msgSize}`);
+
+        // Phase 2: source (skip if too large or on timeout)
+        if (msgSize > 0 && msgSize <= MAX_SOURCE_SIZE) {
+          try {
+            const full = await Promise.race([
+              client.fetchOne(
+                String(uid),
+                { uid: true, source: true },
+                { uid: true },
+              ),
+              new Promise<never>((_, rej) =>
+                setTimeout(() => rej(new Error(`source_timeout uid=${uid}`)), SOURCE_TIMEOUT_MS),
+              ),
+            ]) as { source?: Uint8Array } | null;
+            if (full?.source) (meta as { source?: Uint8Array }).source = full.source;
+          } catch (e) {
+            console.warn(`[${account.email_address}] source fetch uid=${uid} FAILED: ${(e as Error).message} — using envelope-only`);
+            // envelope-only で yield して挿入
+          }
+        } else if (msgSize > MAX_SOURCE_SIZE) {
+          console.warn(`[${account.email_address}] uid=${uid} size=${msgSize} exceeds ${MAX_SOURCE_SIZE} — using envelope-only`);
+        }
+
+        consecutiveSkips = 0;
+        yield meta as never;
       }
     })();
     diag.skipped_uids = skippedUids;
@@ -298,9 +323,43 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       if (processed >= MAX_PER_RUN) break;
       processed++;
       console.log(`[${account.email_address}] got msg uid=${msg.uid} bytes=${msg.source?.length ?? 0}`);
-      if (!msg.source) continue;
-      const parsed = await simpleParser(msg.source);
-      console.log(`[${account.email_address}] parsed uid=${msg.uid}`);
+      // source がある場合は mailparser でフルパース。
+      // envelope-only フォールバックの場合は envelope から最小の parsed 相当を構築。
+      // deno-lint-ignore no-explicit-any
+      let parsed: any;
+      if (msg.source) {
+        parsed = await simpleParser(msg.source);
+        console.log(`[${account.email_address}] parsed uid=${msg.uid}`);
+      } else if (msg.envelope) {
+        const env = msg.envelope as {
+          date?: Date | string;
+          subject?: string;
+          messageId?: string;
+          inReplyTo?: string;
+          from?: Array<{ name?: string; address?: string }>;
+          to?: Array<{ name?: string; address?: string }>;
+          cc?: Array<{ name?: string; address?: string }>;
+        };
+        const toValue = (arr?: Array<{ name?: string; address?: string }>) =>
+          arr ? { value: arr.map((a) => ({ address: a.address, name: a.name })) } : undefined;
+        parsed = {
+          messageId: env.messageId,
+          inReplyTo: env.inReplyTo,
+          references: [],
+          from: env.from?.[0] ? { value: [{ address: env.from[0].address, name: env.from[0].name }] } : undefined,
+          to: toValue(env.to),
+          cc: toValue(env.cc),
+          subject: env.subject,
+          text: "[本文取得失敗 — メールサイズが大きすぎるかサーバ応答タイムアウト。WebMail で確認してください]",
+          html: null,
+          date: env.date ? new Date(env.date) : (msg.internalDate ? new Date(msg.internalDate) : new Date()),
+          attachments: [],
+        };
+        console.log(`[${account.email_address}] envelope-only uid=${msg.uid}`);
+      } else {
+        console.warn(`[${account.email_address}] uid=${msg.uid} has neither source nor envelope — skip`);
+        continue;
+      }
 
       const messageId = parsed.messageId ?? null;
       const inReplyTo = parsed.inReplyTo ?? null;
