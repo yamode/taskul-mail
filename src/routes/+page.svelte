@@ -980,12 +980,16 @@
       wheelTimer = setTimeout(wheelFinalize, 500);
     };
 
+    // wheel は移動する node ではなく移動しない親 (.thread-swipe) に張る。
+    // node を translateX で大きくずらすと node 自身がポインタから外れ、
+    // 途中で wheel イベントが届かなくなるため。
+    const wheelHost: HTMLElement = node.parentElement ?? node;
     node.addEventListener("pointerdown", onDown);
     node.addEventListener("pointermove", onMove);
     node.addEventListener("pointerup", onUp);
     node.addEventListener("pointercancel", onUp);
     node.addEventListener("click", onClickCapture, true);
-    node.addEventListener("wheel", onWheel, { passive: false });
+    wheelHost.addEventListener("wheel", onWheel, { passive: false });
 
     return {
       destroy() {
@@ -994,7 +998,7 @@
         node.removeEventListener("pointerup", onUp);
         node.removeEventListener("pointercancel", onUp);
         node.removeEventListener("click", onClickCapture, true);
-        node.removeEventListener("wheel", onWheel);
+        wheelHost.removeEventListener("wheel", onWheel);
         if (wheelTimer) clearTimeout(wheelTimer);
       },
     };
