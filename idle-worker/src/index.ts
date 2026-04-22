@@ -6,7 +6,7 @@
 // 落ちても Supabase Cron (5 分毎) がフォールバックで走るので、取りこぼしは発生しない。
 
 import { ImapFlow } from "imapflow";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 import http from "node:http";
 
@@ -34,7 +34,7 @@ function requireEnv(key: string): string {
   return v;
 }
 
-const sb: SupabaseClient = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
+const sb = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
   db: { schema: "mail" },
 });
