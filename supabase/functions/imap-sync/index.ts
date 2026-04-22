@@ -136,56 +136,57 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       effectiveLastUid = 0;
     }
 
-    // Courier は UIDNEXT を SELECT に返さず、selected mailbox への STATUS でハングするため、
-    // EXISTS (シーケンス件数) から最大シーケンス番号を取り、sequence 指定で UID を探る。
     const exists = Number((mailbox as { exists?: number }).exists ?? 0);
     diag.exists = exists;
+    diag.from_uid = fromUid;
 
-    let uidNext = Number((mailbox as { uidNext?: number }).uidNext ?? 0);
-    let currentMaxUid = uidNext > 0 ? uidNext - 1 : 0;
-
-    // uidNext が取れてない場合は末尾メッセージの UID をシーケンス指定で取得
-    if (currentMaxUid === 0 && exists > 0) {
-      for await (const m of client.fetch(`${exists}:${exists}`, { uid: true }, { uid: false })) {
-        currentMaxUid = Number(m.uid);
+    // 末尾メッセージの UID を sequence 指定で確認。
+    // stored_last_uid が実際の最大 UID を超えているケース (バグ・手動リセット後等) を自動検知するため。
+    let actualMaxUid = 0;
+    if (exists > 0) {
+      for await (const m of client.fetch(`${exists}:${exists}`, { uid: true })) {
+        actualMaxUid = Number(m.uid);
       }
     }
-    diag.uidnext = uidNext;
-
-    // 初回同期 (last_uid=0) は直近 100 件から。全件遡ると Edge Function が時間切れで落ちる。
-    if (effectiveLastUid === 0 && currentMaxUid > 100) {
-      fromUid = currentMaxUid - 99;
+    diag.actual_max_uid = actualMaxUid;
+    if (fromUid > actualMaxUid) {
+      console.warn(`[${account.email_address}] fromUid(${fromUid}) > actualMaxUid(${actualMaxUid}), resetting to first sync`);
+      fromUid = 1;
+      effectiveLastUid = 0;
     }
-    diag.from_uid = fromUid;
-    diag.current_max_uid = currentMaxUid;
 
-    // 1 回の呼び出しで処理する上限。超えた分は次回の tick で続きを取る。
-    // wall clock 時間切れを避けるため、UID 範囲を明示的に区切る。
+    // 1 回あたりの処理上限。Edge Function の wall clock を考慮して抑えめに。
     const MAX_PER_RUN = 30;
-    const toUid = Math.min(currentMaxUid, fromUid + MAX_PER_RUN - 1);
     let processed = 0;
-    let hitLimit = currentMaxUid > toUid;
-
     let maxSeenUid = effectiveLastUid;
     const touchedThreads = new Map<string, string>();
 
-    diag.to_uid = toUid;
-    const shouldFetch = currentMaxUid >= fromUid;
-    diag.should_fetch = shouldFetch;
+    // 初回同期 (last_uid=0): sequence 末尾から MAX_PER_RUN 件。UID が飛び飛びでも確実に取れる。
+    // 差分同期 (last_uid>0): UID で `fromUid:*` を指定し、実在メッセージだけ取る。
+    const isFirstSync = effectiveLastUid === 0;
+    const fetchRange = isFirstSync
+      ? (exists > 0 ? `${Math.max(1, exists - MAX_PER_RUN + 1)}:${exists}` : null)
+      : `${fromUid}:*`;
+    diag.fetch_range = fetchRange;
+    diag.is_first_sync = isFirstSync;
 
-    // 差分フェッチ (source は本文込み)
-    const fetchIter = shouldFetch
+    const fetchIter = fetchRange
       ? client.fetch(
-          `${fromUid}:${toUid}`,
+          fetchRange,
           { uid: true, envelope: true, source: true, internalDate: true },
-          { uid: true },
+          { uid: !isFirstSync },
         )
       : (async function* () {})();
+    const shouldFetch = fetchRange !== null;
 
+    console.log(`[${account.email_address}] fetchRange=${fetchRange} isFirstSync=${isFirstSync} exists=${exists}`);
     for await (const msg of fetchIter) {
+      if (processed >= MAX_PER_RUN) break;
       processed++;
+      console.log(`[${account.email_address}] got msg uid=${msg.uid} bytes=${msg.source?.length ?? 0}`);
       if (!msg.source) continue;
       const parsed = await simpleParser(msg.source);
+      console.log(`[${account.email_address}] parsed uid=${msg.uid}`);
 
       const messageId = parsed.messageId ?? null;
       const inReplyTo = parsed.inReplyTo ?? null;
@@ -280,7 +281,7 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
           received_at: (parsed.date ?? new Date()).toISOString(),
           has_attachments: (parsed.attachments?.length ?? 0) > 0,
           direction: "inbound",
-          raw_headers: Object.fromEntries(parsed.headers ?? []),
+          raw_headers: {},
         },
         { onConflict: "account_id,imap_uid" },
       );
@@ -293,12 +294,6 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       touchedThreads.set(threadId!, (parsed.date ?? new Date()).toISOString());
 
       if (Number(msg.uid) > maxSeenUid) maxSeenUid = Number(msg.uid);
-    }
-
-    // フェッチ範囲を完走したら last_uid を toUid まで進める。
-    // UID に欠番 (削除済み) がある場合に同じ範囲を再フェッチし続けるのを防ぐ。
-    if (shouldFetch && toUid > maxSeenUid) {
-      maxSeenUid = toUid;
     }
 
     // 触ったスレッドの message_count と last_message_at をまとめて更新
@@ -324,7 +319,7 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       .eq("id", account.id);
 
     diag.processed = processed;
-    diag.hit_limit = hitLimit;
+    diag.hit_limit = processed >= MAX_PER_RUN;
     diag.max_seen_uid = maxSeenUid;
   } finally {
     lock.release();

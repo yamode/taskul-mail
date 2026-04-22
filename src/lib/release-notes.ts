@@ -6,6 +6,17 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.2.5",
+    date: "2026-04-22",
+    changes: [
+      "UID が飛び飛び (大量の削除履歴あり) のメールボックスで同期が進まないバグを修正",
+      "初回同期は UID ではなく sequence 番号 (末尾からの件数指定) で確実に取得する方式に変更",
+      "差分同期は fromUid:* (UID) で実在メッセージのみ取得、無駄な空範囲スキャンを排除",
+      "stored_last_uid が実際の最大 UID を超えている不整合状態を検知したら自動的に初回同期扱いにリセット",
+      "Edge Function のリアルタイムログを強化 (ハング箇所をダッシュボードから追跡可能に)",
+    ],
+  },
+  {
     version: "0.2.4",
     date: "2026-04-22",
     changes: [
