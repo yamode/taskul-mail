@@ -199,6 +199,42 @@
     draft = { id: data!.id, subject: data!.subject ?? subject, body_text: data!.body_text ?? body };
   }
 
+  async function startForward() {
+    if (!selectedMessageId) return;
+    const src = messages.find((m) => m.id === selectedMessageId);
+    if (!src || !src.account_id) return;
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+
+    const subject = src.subject?.match(/^\s*fwd?\s*:/i) ? src.subject : `Fwd: ${src.subject ?? ""}`;
+    const header =
+      `\n\n--- 転送メッセージ ---\n` +
+      `From: ${src.from_name ? `${src.from_name} <${src.from_address}>` : src.from_address ?? ""}\n` +
+      `Date: ${new Date(src.received_at).toLocaleString("ja-JP")}\n` +
+      `Subject: ${src.subject ?? ""}\n` +
+      `To: ${(src.to_addresses ?? []).join(", ")}\n\n`;
+    const body = header + (src.body_text ?? "");
+
+    const { data, error } = await mail
+      .from("drafts")
+      .insert({
+        account_id: src.account_id,
+        author_id: user.id,
+        in_reply_to_message_id: null,
+        thread_id: null,
+        to_addresses: [],
+        cc_addresses: [],
+        subject,
+        body_text: body,
+        generated_by_ai: false,
+        status: "draft",
+      })
+      .select("id,subject,body_text")
+      .single();
+    if (error) { alert(`下書き作成失敗: ${error.message}`); return; }
+    draft = { id: data!.id, subject: data!.subject ?? subject, body_text: data!.body_text ?? body };
+  }
+
   async function generateDraft() {
     if (!selectedMessageId) return;
     generating = true;
@@ -311,6 +347,21 @@
     {#if messages.length === 0}
       <p class="empty">スレッドを選択してください</p>
     {:else}
+      <header class="detail-toolbar">
+        <button onclick={() => startManualReply(false)} disabled={!selectedMessageId}>
+          ↩ 返信
+        </button>
+        <button onclick={() => startManualReply(true)} disabled={!selectedMessageId}>
+          ↩↩ 全員に返信
+        </button>
+        <button onclick={startForward} disabled={!selectedMessageId}>
+          → 転送
+        </button>
+        <span class="spacer"></span>
+        <button onclick={generateDraft} disabled={generating || !selectedMessageId}>
+          {generating ? "生成中..." : "✨ Claude 下書き"}
+        </button>
+      </header>
       {#each messages as m}
         <div
           class="message"
@@ -331,29 +382,13 @@
       {/each}
 
       <div class="draft-panel">
-        <h3>返信</h3>
-        <div class="reply-buttons">
-          <button
-            class="primary"
-            onclick={() => startManualReply(false)}
-            disabled={!selectedMessageId}
-          >
-            返信
-          </button>
-          <button onclick={() => startManualReply(true)} disabled={!selectedMessageId}>
-            全員に返信
-          </button>
-        </div>
         <details>
-          <summary>Claude で下書き生成</summary>
+          <summary>Claude の下書きにトーン指示を渡す</summary>
           <input
             type="text"
             placeholder="トーン指示 (例: 丁寧に、簡潔に、提案を含めて)"
             bind:value={hint}
           />
-          <button onclick={generateDraft} disabled={generating || !selectedMessageId}>
-            {generating ? "生成中..." : "Claude で下書き生成"}
-          </button>
         </details>
 
         {#if draft}
@@ -449,8 +484,33 @@
   }
   .participants { font-size: 0.8rem; color: #666; }
   .empty-list { color: #999; padding: 1rem; text-align: center; font-size: 0.9rem; }
-  .detail { overflow-y: auto; padding: 1rem; }
-  .empty { color: #999; text-align: center; margin-top: 4rem; }
+  .detail { overflow-y: auto; padding: 0; }
+  .detail .message,
+  .detail .draft-panel { margin-left: 1rem; margin-right: 1rem; }
+  .detail .message:first-of-type { margin-top: 1rem; }
+  .empty { color: #999; text-align: center; margin-top: 4rem; padding: 0 1rem; }
+  .detail-toolbar {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.6rem 1rem;
+    background: #fff;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  .detail-toolbar button {
+    padding: 0.4rem 0.75rem;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.875rem;
+  }
+  .detail-toolbar button:hover:not(:disabled) { background: #f3f4f6; }
+  .detail-toolbar button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .detail-toolbar .spacer { flex: 1; }
   .message {
     background: #fff;
     border: 1px solid #e5e7eb;
