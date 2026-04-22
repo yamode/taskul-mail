@@ -2,6 +2,7 @@
   import { supabase, mail, fnUrl, authHeader } from "$lib/supabase";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
+  import { page } from "$app/stores";
 
   type Account = { id: string; label: string; email_address: string };
 
@@ -22,7 +23,13 @@
       .select("id,label,email_address")
       .order("created_at");
     accounts = (data ?? []) as Account[];
-    if (accounts.length > 0 && !accountId) accountId = accounts[0].id;
+    // URL ?account=<id> でプリセレクト (inbox の「新規作成」ボタンから)
+    const preset = $page.url.searchParams.get("account");
+    if (preset && accounts.some((a) => a.id === preset)) {
+      accountId = preset;
+    } else if (accounts.length > 0 && !accountId) {
+      accountId = accounts[0].id;
+    }
   });
 
   function splitAddrs(s: string): string[] {

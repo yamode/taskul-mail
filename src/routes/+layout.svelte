@@ -48,9 +48,8 @@
       </button>
       <nav>
         <a href="/">受信トレイ</a>
-        <a href="/drafts">下書き</a>
-        <a href="/compose">新規作成</a>
         <a href="/accounts">アカウント</a>
+        <a href="/ai-settings">AI 設定</a>
       </nav>
       <span>{session.user.email}</span>
       <button onclick={signOut}>ログアウト</button>

@@ -44,7 +44,7 @@
 
   let threads = $state<Thread[]>([]);
   let accounts = $state<Account[]>([]);
-  let filterAccountId = $state<string>("all");
+  let filterAccountId = $state<string>("");
   let selectedThreadId = $state<string | null>(null);
   let messages = $state<Message[]>([]);
   let selectedMessageId = $state<string | null>(null);
@@ -56,9 +56,9 @@
   let hoverThreadId = $state<string | null>(null);
 
   let filtered = $derived(
-    filterAccountId === "all"
-      ? threads
-      : threads.filter((t) => t.account_id === filterAccountId),
+    filterAccountId
+      ? threads.filter((t) => t.account_id === filterAccountId)
+      : [],
   );
 
   // 同期状態: アカウントごとに独立管理する。
@@ -221,16 +221,92 @@
       .select("id,label,is_shared,sort_order,default_tone")
       .order("sort_order")
       .order("created_at");
+    let rows: Account[];
     if (error && /default_tone/.test(error.message ?? "")) {
       const { data: data2 } = await mail
         .from("accounts")
         .select("id,label,is_shared,sort_order")
         .order("sort_order")
         .order("created_at");
-      accounts = (data2 ?? []) as Account[];
-      return;
+      rows = (data2 ?? []) as Account[];
+    } else {
+      rows = (data ?? []) as Account[];
     }
-    accounts = (data ?? []) as Account[];
+    accounts = rows;
+    // 初回ロード時は先頭アカウントを自動選択 ("すべて" は廃止)
+    if (!filterAccountId && rows.length > 0) {
+      const saved = (() => {
+        try { return localStorage.getItem("taskul-mail.filter-account-id"); }
+        catch { return null; }
+      })();
+      filterAccountId = (saved && rows.some((a) => a.id === saved)) ? saved : rows[0].id;
+    }
+  }
+
+  function selectAccount(id: string) {
+    filterAccountId = id;
+    try { localStorage.setItem("taskul-mail.filter-account-id", id); } catch { /* ignore */ }
+  }
+
+  // アカウントの未読メールを一斉に既読にする
+  async function markAllReadForAccount(accountId: string, e: Event) {
+    e.stopPropagation();
+    if (!userId) return;
+    const acc = accounts.find((a) => a.id === accountId);
+    if (!acc) return;
+    if (!confirm(`「${acc.label}」の未読メールをすべて既読にしますか？`)) return;
+    // 対象アカウントの全 inbound メッセージ ID を取得
+    const { data: msgs } = await mail
+      .from("messages")
+      .select("id")
+      .eq("account_id", accountId)
+      .eq("direction", "inbound");
+    const ids = (msgs ?? []).map((m: any) => m.id as string);
+    if (ids.length === 0) return;
+    // 既読済み分を除いて insert (ignoreDuplicates)
+    const rows = ids.map((mid) => ({ message_id: mid, user_id: userId! }));
+    const { error } = await mail
+      .from("message_reads")
+      .upsert(rows, { onConflict: "message_id,user_id", ignoreDuplicates: true });
+    if (error) { alert(`一括既読に失敗: ${error.message}`); return; }
+    // ローカルカウント 0 化
+    accounts = accounts.map((a) =>
+      a.id === accountId ? { ...a, unread_count: 0 } : a,
+    );
+    threads = threads.map((t) =>
+      t.account_id === accountId ? { ...t, unread_count: 0 } : t,
+    );
+  }
+
+  // AI 設定 (トーン) 編集モーダル
+  let toneModalOpen = $state(false);
+  let toneModalDraft = $state("");
+  let toneModalSaving = $state(false);
+  let currentAccount = $derived(accounts.find((a) => a.id === filterAccountId) ?? null);
+
+  function openToneModal() {
+    if (!currentAccount) return;
+    toneModalDraft = currentAccount.default_tone ?? "";
+    toneModalOpen = true;
+  }
+  async function saveToneModal() {
+    if (!currentAccount) return;
+    toneModalSaving = true;
+    try {
+      const { error } = await mail
+        .from("accounts")
+        .update({ default_tone: toneModalDraft })
+        .eq("id", currentAccount.id);
+      if (error) throw error;
+      accounts = accounts.map((a) =>
+        a.id === currentAccount!.id ? { ...a, default_tone: toneModalDraft } : a,
+      );
+      toneModalOpen = false;
+    } catch (e) {
+      alert(`保存失敗: ${(e as Error).message}`);
+    } finally {
+      toneModalSaving = false;
+    }
   }
 
   // アカウントサイドバー折りたたみ状態 (localStorage 永続化)
@@ -571,13 +647,13 @@
     await loadThreads();
   }
 
-  // Svelte action: 左スワイプ (タッチ) / 左ドラッグ (マウス) で削除を発火する。
-  // Pointer Events に統一して iOS/Android のタッチと Mac/Win のマウスを両方サポート。
-  // - 最初の 8px で horizontal/vertical を確定 (縦スクロール優先)
-  // - horizontal と決まったら setPointerCapture して枠外でも追従
-  // - 閾値 (-100px) 越えで card を -110% にスライドアウト → onSwipe 発火
-  // - それ以外は元位置に戻す
-  // クリック誤爆防止: 8px 未満の動きでは active を解除せず、button の click は通常通り発火。
+  // Svelte action: 左スワイプで削除を発火する。3 種類の入力に対応:
+  //   (1) タッチ (iOS/Android/iPad)     — Pointer Events
+  //   (2) マウス左クリック+ドラッグ       — Pointer Events
+  //   (3) Mac トラックパッド 2 本指スワイプ — wheel Events (クリック不要)
+  //
+  // 共通フロー: 左方向の累積量が threshold (-100px) を超えたら card を
+  // -110% までスライドアウトさせて onSwipe を発火。
   function swipeable(
     node: HTMLElement,
     params: { threshold: number; onSwipe: () => void },
@@ -591,8 +667,28 @@
     const bgEl = (): HTMLElement | null =>
       node.parentElement?.querySelector(".swipe-bg") ?? null;
 
+    const updateVisual = (off: number) => {
+      node.style.transform = `translateX(${off}px)`;
+      const bg = bgEl();
+      if (bg) {
+        const ratio = Math.min(1, Math.abs(off) / Math.abs(threshold));
+        bg.style.opacity = String(0.25 + ratio * 0.75);
+      }
+    };
+    const finalize = (off: number) => {
+      node.style.transition = "transform 200ms ease-out";
+      const bg = bgEl();
+      if (off <= threshold) {
+        node.style.transform = "translateX(-110%)";
+        setTimeout(() => params.onSwipe(), 180);
+      } else {
+        node.style.transform = "";
+        if (bg) bg.style.opacity = "";
+      }
+    };
+
+    // ----- (1)(2) Pointer: タッチ & マウスドラッグ -----
     const onDown = (e: PointerEvent) => {
-      // マウスは左ボタンのみ。ペン/タッチはそのまま。
       if (e.pointerType === "mouse" && e.button !== 0) return;
       startX = e.clientX; startY = e.clientY;
       active = true; decided = false; horizontal = false;
@@ -610,36 +706,19 @@
         decided = true;
         if (!horizontal) { active = false; return; }
         try { node.setPointerCapture(e.pointerId); } catch { /* ignore */ }
-        suppressClick = true; // 水平ドラッグ確定後の click は抑止
+        suppressClick = true;
       }
       e.preventDefault();
-      const off = Math.min(0, dx);
-      node.style.transform = `translateX(${off}px)`;
-      const bg = bgEl();
-      if (bg) {
-        const ratio = Math.min(1, Math.abs(off) / Math.abs(threshold));
-        bg.style.opacity = String(0.25 + ratio * 0.75);
-      }
+      updateVisual(Math.min(0, dx));
     };
     const onUp = (e: PointerEvent) => {
       if (!active || e.pointerId !== pid) return;
       active = false;
       const m = node.style.transform.match(/-?\d+(\.\d+)?/);
-      const off = m ? parseFloat(m[0]) : 0;
-      node.style.transition = "transform 200ms ease-out";
-      const bg = bgEl();
-      if (off <= threshold) {
-        node.style.transform = "translateX(-110%)";
-        setTimeout(() => params.onSwipe(), 180);
-      } else {
-        node.style.transform = "";
-        if (bg) bg.style.opacity = "";
-      }
+      finalize(m ? parseFloat(m[0]) : 0);
       try { node.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
       pid = null;
     };
-
-    // ドラッグ後の click (button onclick) がスレッドを開いてしまうのを抑止
     const onClickCapture = (e: MouseEvent) => {
       if (suppressClick) {
         e.stopPropagation();
@@ -648,11 +727,50 @@
       }
     };
 
+    // ----- (3) wheel: Mac トラックパッド 2 本指スワイプ -----
+    // Mac ナチュラルスクロールでは 2 本指を左に動かすと deltaX > 0 になる。
+    // 累積して左方向の動きが閾値を超えたら削除。120ms イベントが来なければ確定。
+    let wheelAccum = 0;
+    let wheelTimer: ReturnType<typeof setTimeout> | null = null;
+    const wheelCancel = () => {
+      if (wheelTimer) { clearTimeout(wheelTimer); wheelTimer = null; }
+      if (wheelAccum !== 0) {
+        node.style.transition = "transform 150ms ease-out";
+        node.style.transform = "";
+        const bg = bgEl();
+        if (bg) bg.style.opacity = "";
+      }
+      wheelAccum = 0;
+    };
+    const wheelFinalize = () => {
+      wheelTimer = null;
+      const off = -wheelAccum;
+      wheelAccum = 0;
+      finalize(off);
+    };
+    const onWheel = (e: WheelEvent) => {
+      // 垂直優位の wheel (普通の縦スクロール) は一切触らない
+      if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
+      // 右方向スワイプ (deltaX < 0) は削除対象外。途中ならリセット。
+      if (e.deltaX < 0) {
+        if (wheelAccum > 0) wheelCancel();
+        return;
+      }
+      // 左方向スワイプ: 水平 wheel を hijack して card を動かす
+      e.preventDefault();
+      node.style.transition = "none";
+      wheelAccum += e.deltaX;
+      updateVisual(-wheelAccum);
+      if (wheelTimer) clearTimeout(wheelTimer);
+      wheelTimer = setTimeout(wheelFinalize, 120);
+    };
+
     node.addEventListener("pointerdown", onDown);
     node.addEventListener("pointermove", onMove);
     node.addEventListener("pointerup", onUp);
     node.addEventListener("pointercancel", onUp);
     node.addEventListener("click", onClickCapture, true);
+    node.addEventListener("wheel", onWheel, { passive: false });
 
     return {
       destroy() {
@@ -661,6 +779,8 @@
         node.removeEventListener("pointerup", onUp);
         node.removeEventListener("pointercancel", onUp);
         node.removeEventListener("click", onClickCapture, true);
+        node.removeEventListener("wheel", onWheel);
+        if (wheelTimer) clearTimeout(wheelTimer);
       },
     };
   }
@@ -799,51 +919,52 @@
     >
       {accountsCollapsed ? "»" : "«"}
     </button>
-    <button
-      class="account"
-      class:selected={filterAccountId === "all"}
-      onclick={() => (filterAccountId = "all")}
-      title="すべてのアカウント"
-    >
-      <span class="account-initial">全</span>
-      <span class="account-label">すべて</span>
-    </button>
     {#each accounts as a (a.id)}
       {@const s = acctSync[a.id]}
-      <button
-        class="account"
-        class:selected={filterAccountId === a.id}
-        class:shared={a.is_shared}
-        draggable="true"
-        ondragstart={() => (dragId = a.id)}
-        ondragover={(e) => e.preventDefault()}
-        ondrop={() => onDropAccount(a.id)}
-        onclick={() => (filterAccountId = a.id)}
-        title={a.label}
-      >
-        <span class="grip" title="ドラッグで並び替え">⋮⋮</span>
-        <span class="account-initial">{a.label.slice(0, 1) || "?"}</span>
-        {#if a.is_shared}
-          <span class="shared-badge" title="共有アカウント">共</span>
+      <div class="account-wrap">
+        <button
+          class="account"
+          class:selected={filterAccountId === a.id}
+          class:shared={a.is_shared}
+          draggable="true"
+          ondragstart={() => (dragId = a.id)}
+          ondragover={(e) => e.preventDefault()}
+          ondrop={() => onDropAccount(a.id)}
+          onclick={() => selectAccount(a.id)}
+          title={a.label}
+        >
+          <span class="grip" title="ドラッグで並び替え">⋮⋮</span>
+          <span class="account-initial">{a.label.slice(0, 1) || "?"}</span>
+          {#if a.is_shared}
+            <span class="shared-badge" title="共有アカウント">共</span>
+          {/if}
+          <span class="account-label">{a.label}</span>
+          {#if !accountsCollapsed && s?.syncing}
+            <span class="acct-spin" title="同期中" aria-hidden="true"></span>
+          {:else if !accountsCollapsed && s?.error}
+            <span
+              class="acct-err"
+              title={`前回エラー: ${s.error} — クリックで再試行`}
+              role="button"
+              tabindex="0"
+              onclick={(e) => { e.stopPropagation(); void syncOneAccount(a.id); }}
+              onkeydown={(e) => { if (e.key === "Enter") { e.stopPropagation(); void syncOneAccount(a.id); } }}
+            >⚠</span>
+          {/if}
+          {#if (a.unread_count ?? 0) > 0}
+            <span class="account-unread">{a.unread_count}</span>
+            <span class="account-unread-dot" aria-hidden="true"></span>
+          {/if}
+        </button>
+        {#if !accountsCollapsed && (a.unread_count ?? 0) > 0}
+          <button
+            class="mark-all-read"
+            title="このアカウントの未読をすべて既読にする"
+            aria-label="すべて既読にする"
+            onclick={(e) => markAllReadForAccount(a.id, e)}
+          >✓✓</button>
         {/if}
-        <span class="account-label">{a.label}</span>
-        {#if s?.syncing}
-          <span class="acct-spin" title="同期中" aria-hidden="true"></span>
-        {:else if s?.error}
-          <span
-            class="acct-err"
-            title={`前回エラー: ${s.error} — クリックで再試行`}
-            role="button"
-            tabindex="0"
-            onclick={(e) => { e.stopPropagation(); void syncOneAccount(a.id); }}
-            onkeydown={(e) => { if (e.key === "Enter") { e.stopPropagation(); void syncOneAccount(a.id); } }}
-          >⚠</span>
-        {/if}
-        {#if (a.unread_count ?? 0) > 0}
-          <span class="account-unread">{a.unread_count}</span>
-          <span class="account-unread-dot" aria-hidden="true"></span>
-        {/if}
-      </button>
+      </div>
     {/each}
     <div class="accounts-footer">
       <button
@@ -879,6 +1000,28 @@
   </aside>
 
   <aside class="threads">
+    {#if currentAccount}
+      <header class="inbox-header">
+        <div class="inbox-header-title">
+          {#if currentAccount.is_shared}
+            <span class="shared-badge" title="共有">共</span>
+          {/if}
+          <span class="inbox-acct-label">{currentAccount.label}</span>
+        </div>
+        <div class="inbox-header-actions">
+          <a
+            class="ih-btn primary"
+            href={`/compose?account=${currentAccount.id}`}
+            title="このアカウントから新規作成"
+          >✉ 新規作成</a>
+          <button
+            class="ih-btn"
+            onclick={openToneModal}
+            title="このアカウントの AI トーン設定を編集"
+          >✨ AI 設定</button>
+        </div>
+      </header>
+    {/if}
     {#each filtered as t (t.id)}
       <div class="thread-swipe">
         <div class="swipe-bg" aria-hidden="true">
@@ -1073,6 +1216,42 @@
   </section>
 </div>
 
+{#if toneModalOpen && currentAccount}
+  <div class="modal-backdrop" role="presentation" onclick={() => (toneModalOpen = false)}>
+    <div
+      class="tone-modal"
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => { if (e.key === "Escape") toneModalOpen = false; }}
+    >
+      <h3>AI 返信トーン設定</h3>
+      <p class="tone-modal-sub">
+        <strong>{currentAccount.label}</strong> ({currentAccount.is_shared ? "共有" : "個人"})
+      </p>
+      <label class="tone-modal-field">
+        <span>基本トーン指示</span>
+        <textarea
+          rows="6"
+          bind:value={toneModalDraft}
+          placeholder="例: 丁寧・簡潔に、宿の担当者として応対。返答は短めに、ですます調で。"
+        ></textarea>
+        <small>
+          このアカウントで「✨ 再生成」した際に常に Claude へ渡される基本指示です。<br>
+          個別メールごとの「追加指示」は返信コンポーズ画面で別途入力できます。
+        </small>
+      </label>
+      <div class="tone-modal-actions">
+        <button onclick={() => (toneModalOpen = false)}>キャンセル</button>
+        <button class="primary" onclick={saveToneModal} disabled={toneModalSaving}>
+          {toneModalSaving ? "保存中…" : "保存"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if recentlyDeletedIds.length > 0}
   <div class="undo-toast" role="status">
     <span>🗑 {recentlyDeletedIds.length} 件削除しました</span>
@@ -1160,7 +1339,13 @@
   }
   /* 展開モードでは unread-dot は使わない */
   .account-unread-dot { display: none; }
+  .account-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
   .account {
+    flex: 1;
     display: flex;
     align-items: center;
     gap: 0.35rem;
@@ -1172,7 +1357,31 @@
     text-align: left;
     font-size: 0.88rem;
     color: #374151;
+    min-width: 0;
   }
+  .mark-all-read {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 24px;
+    height: 22px;
+    border-radius: 4px;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: #059669;
+    font-size: 0.72rem;
+    font-weight: 700;
+    cursor: pointer;
+    padding: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+  }
+  .account-wrap:hover .mark-all-read { display: inline-flex; }
+  .mark-all-read:hover { background: #ecfdf5; border-color: #6ee7b7; }
   .account:hover { background: #e5e7eb; }
   .account.selected {
     background: #fff;
@@ -1243,7 +1452,56 @@
     overflow-y: auto;
     border-right: 1px solid #e5e7eb;
     background: #fff;
+    /* Safari の戻る/進むジェスチャ抑止 (2 本指スワイプを削除専用に使う) */
+    overscroll-behavior-x: contain;
   }
+  .inbox-header {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    background: #fff;
+    border-bottom: 1px solid #e5e7eb;
+    padding: 0.55rem 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .inbox-header-title {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .inbox-acct-label {
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: #111;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .inbox-header-actions { display: flex; gap: 0.35rem; flex-shrink: 0; }
+  .ih-btn {
+    font-size: 0.82rem;
+    padding: 0.4rem 0.7rem;
+    border-radius: 4px;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: #374151;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+  }
+  .ih-btn:hover { background: #f3f4f6; }
+  .ih-btn.primary {
+    background: #2563eb;
+    color: #fff;
+    border-color: #2563eb;
+  }
+  .ih-btn.primary:hover { background: #1d4ed8; }
   .thread-swipe {
     position: relative;
     overflow: hidden;
@@ -1576,6 +1834,70 @@
     background: #fafafa;
     border-radius: 0 4px 4px 0;
   }
+
+  /* ===== AI トーン設定モーダル ===== */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1200;
+  }
+  .tone-modal {
+    background: #fff;
+    border-radius: 10px;
+    padding: 1.5rem 1.5rem 1.25rem;
+    width: min(540px, 92vw);
+    max-height: 90vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.25);
+  }
+  .tone-modal h3 { margin: 0; font-size: 1.05rem; }
+  .tone-modal-sub { margin: 0; color: #6b7280; font-size: 0.85rem; }
+  .tone-modal-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .tone-modal-field > span { font-size: 0.82rem; color: #374151; font-weight: 600; }
+  .tone-modal-field textarea {
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    padding: 0.6rem 0.7rem;
+    font-family: inherit;
+    font-size: 0.92rem;
+    line-height: 1.5;
+    resize: vertical;
+  }
+  .tone-modal-field textarea:focus { outline: 2px solid #bfdbfe; border-color: #60a5fa; }
+  .tone-modal-field small { color: #6b7280; font-size: 0.76rem; line-height: 1.5; }
+  .tone-modal-actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 0.25rem;
+  }
+  .tone-modal-actions button {
+    padding: 0.5rem 1rem;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  .tone-modal-actions button:hover:not(:disabled) { background: #f3f4f6; }
+  .tone-modal-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .tone-modal-actions .primary {
+    background: #2563eb;
+    color: #fff;
+    border: none;
+  }
+  .tone-modal-actions .primary:hover:not(:disabled) { background: #1d4ed8; }
 
   /* ===== Undo toast (swipe 削除用) ===== */
   .undo-toast {
