@@ -1002,11 +1002,26 @@
 
   async function softDeleteThread(id: string) {
     const prev = threads;
+    // 削除対象が現在選択中なら、表示中リスト (filtered) での位置から
+    // 次 (なければ前) のスレッドを自動選択して開く。
+    const wasSelected = selectedThreadId === id;
+    let nextToOpen: Thread | null = null;
+    if (wasSelected) {
+      const list = filtered;
+      const idx = list.findIndex((x) => x.id === id);
+      if (idx >= 0) {
+        nextToOpen = list[idx + 1] ?? list[idx - 1] ?? null;
+      }
+    }
     threads = threads.filter((x) => x.id !== id);
-    if (selectedThreadId === id) {
-      selectedThreadId = null;
-      messages = [];
-      compose = null;
+    if (wasSelected) {
+      if (nextToOpen) {
+        await openThread(nextToOpen);
+      } else {
+        selectedThreadId = null;
+        messages = [];
+        compose = null;
+      }
     }
     const { error } = await mail
       .from("threads")
@@ -2869,8 +2884,10 @@
     display: flex;
     flex-direction: column;
     gap: 0.6rem;
-    max-width: 880px;
+    background: #fff;
   }
+  /* compose 展開中は detail パネル全体を白背景にして、画面いっぱいに使う */
+  .detail:has(.compose) { background: #fff; }
   .field-row { display: flex; }
   .field {
     display: flex;
