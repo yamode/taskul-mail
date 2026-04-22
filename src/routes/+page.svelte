@@ -839,6 +839,22 @@
   // onSwipe を発火。pointer は指/マウスで簡単に長く引けるため threshold (-300px)
   // を、wheel は trackpad 2 本指で累積 deltaX がそこまで伸びないため
   // wheelThreshold (既定で threshold の半分 = -150px) を使う。
+  //
+  // wheel ロック: 1 回の連続スワイプで複数行が削除されないように、どれか 1
+  // 行の wheel が発火したら水平 wheel が 300ms 止むまで他行の wheel 処理を
+  // 止める。momentum scroll の継続イベントで次の行に波及するのを防ぐ。
+  let wheelLocked = false;
+  let wheelUnlockTimer: ReturnType<typeof setTimeout> | null = null;
+  const armWheelLock = () => {
+    wheelLocked = true;
+    if (wheelUnlockTimer) clearTimeout(wheelUnlockTimer);
+    wheelUnlockTimer = setTimeout(() => { wheelLocked = false; }, 300);
+  };
+  const kickWheelLock = () => {
+    if (!wheelLocked) return;
+    if (wheelUnlockTimer) clearTimeout(wheelUnlockTimer);
+    wheelUnlockTimer = setTimeout(() => { wheelLocked = false; }, 300);
+  };
   function swipeable(
     node: HTMLElement,
     params: { threshold: number; wheelThreshold?: number; onSwipe: () => void },
@@ -932,11 +948,22 @@
       wheelTimer = null;
       const off = -wheelAccum;
       wheelAccum = 0;
+      // 閾値を越えていたら削除発火 + ロック開始。未達ならリセットのみ。
+      if (off <= wheelThreshold) {
+        armWheelLock();
+      }
       finalize(off, wheelThreshold);
     };
     const onWheel = (e: WheelEvent) => {
       // 垂直優位の wheel (普通の縦スクロール) は一切触らない
       if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
+      // 直前のスワイプで削除発火済みなら、momentum の余波を全て無視。
+      // さらに水平 wheel が続いている間はロックを延長する。
+      if (wheelLocked) {
+        e.preventDefault();
+        kickWheelLock();
+        return;
+      }
       // 右方向スワイプ (deltaX < 0) は削除対象外。途中ならリセット。
       if (e.deltaX < 0) {
         if (wheelAccum > 0) wheelCancel();
@@ -947,14 +974,8 @@
       node.style.transition = "none";
       wheelAccum += e.deltaX;
       updateVisual(-wheelAccum, wheelThreshold);
-      // 閾値を越えた時点で即発火 (ゆっくりスワイプでも確定させる)
-      if (-wheelAccum <= wheelThreshold) {
-        if (wheelTimer) { clearTimeout(wheelTimer); wheelTimer = null; }
-        wheelFinalize();
-        return;
-      }
-      // 閾値未達のまま無操作が続いた場合のみリセット。ゆっくりスワイプを
-      // 許容するために 500ms まで待つ。
+      // 閾値到達・未達いずれも 500ms の無操作でスワイプ終了と判定し finalize。
+      // 閾値越えなら削除、未達ならリセット。
       if (wheelTimer) clearTimeout(wheelTimer);
       wheelTimer = setTimeout(wheelFinalize, 500);
     };
