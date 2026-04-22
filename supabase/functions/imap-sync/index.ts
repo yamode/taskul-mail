@@ -149,10 +149,11 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
       }
     }
     diag.actual_max_uid = actualMaxUid;
-    if (fromUid > actualMaxUid) {
-      console.warn(`[${account.email_address}] fromUid(${fromUid}) > actualMaxUid(${actualMaxUid}), resetting to first sync`);
-      fromUid = 1;
-      effectiveLastUid = 0;
+    // storedLastUid がサーバの最大 UID を超えていたら (過去バグや手動編集) キャップ
+    if (effectiveLastUid > actualMaxUid) {
+      console.warn(`[${account.email_address}] effectiveLastUid(${effectiveLastUid}) > actualMaxUid(${actualMaxUid}), capping`);
+      effectiveLastUid = actualMaxUid;
+      fromUid = actualMaxUid + 1;
     }
 
     // 1 回あたりの処理上限。Edge Function の wall clock を考慮して抑えめに。
@@ -161,26 +162,57 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     let maxSeenUid = effectiveLastUid;
     const touchedThreads = new Map<string, string>();
 
-    // 初回同期 (last_uid=0): sequence 末尾から MAX_PER_RUN 件。UID が飛び飛びでも確実に取れる。
-    // 差分同期 (last_uid>0): UID で `fromUid:actualMaxUid` を指定。
-    // (`fromUid:*` だと imapflow が FETCH OK を受け取れず iterator が閉じないサーバがある)
-    const isFirstSync = effectiveLastUid === 0;
-    const fetchRange = isFirstSync
-      ? (exists > 0 ? `${Math.max(1, exists - MAX_PER_RUN + 1)}:${exists}` : null)
-      : (actualMaxUid >= fromUid ? `${fromUid}:${actualMaxUid}` : null);
+    // 同期済みの最古 UID を取得 (backfill の起点)
+    const { data: oldestRow } = await sb
+      .from("messages")
+      .select("imap_uid")
+      .eq("account_id", account.id)
+      .order("imap_uid", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    const oldestSyncedUid = oldestRow ? Number(oldestRow.imap_uid) : null;
+    diag.oldest_synced_uid = oldestSyncedUid;
+
+    // 同期モード判定:
+    // - first: まだ何も同期していない → sequence 末尾から N 件
+    // - forward: 新着あり (actualMaxUid > last_uid) → UID の forward 範囲
+    // - backfill: 過去メールが未取得 (oldestSyncedUid > 1) → UID の backfill 範囲
+    // - idle: 同期済み
+    let mode: "first" | "forward" | "backfill" | "idle";
+    let fetchRange: string | null = null;
+    let isSeqRange = false;
+
+    if (effectiveLastUid === 0 && oldestSyncedUid === null) {
+      mode = "first";
+      fetchRange = exists > 0
+        ? `${Math.max(1, exists - MAX_PER_RUN + 1)}:${exists}`
+        : null;
+      isSeqRange = true;
+    } else if (actualMaxUid > effectiveLastUid) {
+      mode = "forward";
+      fetchRange = `${effectiveLastUid + 1}:${actualMaxUid}`;
+      isSeqRange = false;
+    } else if (oldestSyncedUid !== null && oldestSyncedUid > 1) {
+      mode = "backfill";
+      fetchRange = `1:${oldestSyncedUid - 1}`;
+      isSeqRange = false;
+    } else {
+      mode = "idle";
+    }
+    diag.mode = mode;
     diag.fetch_range = fetchRange;
-    diag.is_first_sync = isFirstSync;
+    const isFirstSync = mode === "first";
 
     const fetchIter = fetchRange
       ? client.fetch(
           fetchRange,
           { uid: true, envelope: true, source: true, internalDate: true },
-          { uid: !isFirstSync },
+          { uid: !isSeqRange },
         )
       : (async function* () {})();
     const shouldFetch = fetchRange !== null;
 
-    console.log(`[${account.email_address}] START fetchRange=${fetchRange} isFirstSync=${isFirstSync} exists=${exists} fromUid=${fromUid} actualMaxUid=${actualMaxUid}`);
+    console.log(`[${account.email_address}] START mode=${mode} fetchRange=${fetchRange} exists=${exists} lastUid=${effectiveLastUid} actualMaxUid=${actualMaxUid} oldestSyncedUid=${oldestSyncedUid}`);
     for await (const msg of fetchIter) {
       if (processed >= MAX_PER_RUN) break;
       processed++;

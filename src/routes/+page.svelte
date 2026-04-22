@@ -122,6 +122,11 @@
     }
   }
 
+  // 新着スレッド検出用: 前回ロード時のスレッドIDセット。
+  // ここにない ID が新たに出現したらアニメーション対象とする。
+  let knownThreadIds = new Set<string>();
+  let newThreadIds = $state<Set<string>>(new Set());
+
   async function loadThreads() {
     const { data, error } = await mail
       .from("threads")
@@ -137,12 +142,13 @@
     }));
 
     // 未読カウント: inbound メッセージ数 - 自分の既読数
+    const perAccount = new Map<string, number>();
     if (base.length > 0 && userId) {
       const threadIds = base.map((t) => t.id);
       const [{ data: inbound }, { data: reads }] = await Promise.all([
         mail
           .from("messages")
-          .select("id,thread_id")
+          .select("id,thread_id,account_id")
           .in("thread_id", threadIds)
           .eq("direction", "inbound"),
         mail
@@ -155,9 +161,30 @@
       for (const m of (inbound ?? []) as any[]) {
         if (!readSet.has(m.id)) {
           counts.set(m.thread_id, (counts.get(m.thread_id) ?? 0) + 1);
+          perAccount.set(m.account_id, (perAccount.get(m.account_id) ?? 0) + 1);
         }
       }
       for (const t of base) t.unread_count = counts.get(t.id) ?? 0;
+    }
+
+    // 未読カウントをアカウントに反映
+    accounts = accounts.map((a) => ({
+      ...a,
+      unread_count: perAccount.get(a.id) ?? 0,
+    }));
+
+    // 新着スレッド検出 (初回ロード時はアニメなし)
+    const justArrived = new Set<string>();
+    if (knownThreadIds.size > 0) {
+      for (const t of base) {
+        if (!knownThreadIds.has(t.id)) justArrived.add(t.id);
+      }
+    }
+    knownThreadIds = new Set(base.map((t) => t.id));
+    if (justArrived.size > 0) {
+      newThreadIds = justArrived;
+      // 3 秒後にアニメーション対象から外す
+      setTimeout(() => { newThreadIds = new Set(); }, 3000);
     }
     threads = base;
   }
@@ -359,6 +386,9 @@
         {#if a.is_shared}
           <span class="shared-badge" title="共有アカウント">共</span>
         {/if}
+        {#if (a.unread_count ?? 0) > 0}
+          <span class="account-unread">{a.unread_count}</span>
+        {/if}
       </button>
     {/each}
     <div class="accounts-footer">
@@ -368,11 +398,12 @@
     </div>
   </aside>
   <aside class="threads">
-    {#each filtered as t}
+    {#each filtered as t (t.id)}
       <button
         class="thread"
         class:selected={selectedThreadId === t.id}
         class:unread={(t.unread_count ?? 0) > 0}
+        class:arrived={newThreadIds.has(t.id)}
         onclick={() => openThread(t)}
       >
         <div class="meta">
@@ -507,6 +538,16 @@
     padding: 0.1rem 0.3rem;
     border-radius: 3px;
   }
+  .account-unread {
+    background: #ef4444;
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 700;
+    padding: 0.1rem 0.4rem;
+    border-radius: 9px;
+    min-width: 1.4rem;
+    text-align: center;
+  }
   .accounts-footer { margin-top: auto; padding-top: 0.5rem; }
   .accounts-footer .reload {
     width: 100%;
@@ -536,6 +577,18 @@
   .thread:hover { background: #f9fafb; }
   .thread.selected { background: #eff6ff; }
   .thread.unread .subject { font-weight: 700; }
+  /* Outlook 風の新着アニメーション: 上からスライドイン + 黄色ハイライトがフェードアウト */
+  .thread.arrived {
+    animation: threadArrive 600ms ease-out, threadHighlight 2.8s ease-out 600ms;
+  }
+  @keyframes threadArrive {
+    from { transform: translateY(-12px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+  @keyframes threadHighlight {
+    0% { background: #fef3c7; }
+    100% { background: transparent; }
+  }
   .badge {
     display: inline-block;
     background: #2563eb;

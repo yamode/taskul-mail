@@ -6,6 +6,16 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.4.0",
+    date: "2026-04-22",
+    changes: [
+      "過去メールの backfill 同期を追加: 初回・新着・過去遡りを毎 tick で自動切替 (first / forward / backfill / idle)",
+      "新着スレッドの Outlook 風アニメーション追加 (スライドイン + ハイライトフェードアウト)",
+      "アカウントサイドバーに未読バッジを表示 (赤い丸で件数)",
+      "storedLastUid がサーバ最大 UID を超えた不整合を auto-reset から cap 方式に変更 (過去メール損失を防止)",
+    ],
+  },
+  {
     version: "0.3.2",
     date: "2026-04-22",
     changes: [
