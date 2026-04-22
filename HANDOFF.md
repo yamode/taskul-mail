@@ -1,134 +1,93 @@
 # HANDOFF.md — taskul-mail
 
-最終更新: 2026-04-22 (dev ブランチ v0.4.3 デプロイ済)
+> **最終更新**: 2026-04-23（VPS IDLE worker 稼働開始・Realtime 拡張・folders スキーマ基盤投入）
 
 ## 現在地サマリ
 
-- 受信トレイの UI（アカウント縦リスト・D&D 並び替え・未読バッジ・新着アニメ・メール本文上部ツールバー）は完成して動作中。
-- アカウント追加・編集・パスワード再設定・Vault 連携は完成。
-- **IMAP 同期が未解決**。1 tick で 1 通だけ upsert した後に imapflow が hang し、wall-clock タイムアウトで強制終了される状態。過去メール backfill もほぼ進んでいない。
+- 受信トレイ UI（アカウント縦リスト・D&D・未読バッジ・3カラム幅調整・sticky ヘッダ・メモパネル）完成して動作中
+- IMAP 同期は **raw IMAP + mailparser** 方式に統一して安定稼働。imapflow の hang 問題は解決済み
+- 添付ファイル取得・表示も実装済み
+- Supabase Realtime は `messages` / `threads` / `message_reads` / `drafts` / `folders` を購読。タブ未読バッジも動作
+- **VPS IDLE worker 本番稼働中**（`~/dev/taskul-mail/idle-worker/` で Docker Compose）。新着レイテンシ 60 秒 → 3 秒以下に改善
+- Cron (5 分毎) は IDLE のフォールバックとして継続稼働
 
-## 同期の現状と既知挙動
+## アーキテクチャ
 
-### アカウント別状況
-- `info@yamado.co.jp` — 25 通あるうち uid=182602 以外は未取得。毎回 1 通目を upsert 後に hang。
-- `reservation@yamado.co.jp` — 数通は取れている。backfill は進んでいない。
-- `office@yamado.co.jp` — 1 通だけ取れている（過去の成功ログあり uid=33524）。
-- `hikaru.s@yamado.co.jp` — **IMAP 認証が通らない**。Courier-IMAP が `1 NO Error in IMAP command received by server.` を返す。WebMail では同じパスワードでログインできる。診断済み（12 文字・制御文字なし・印字可能 ASCII のみ）、LOGIN コマンドとパスワード中の一部文字の相性問題の可能性。AUTHENTICATE PLAIN への切替で解決する可能性があるが未実装。
+- フロント: SvelteKit + Svelte 5 runes、Cloudflare Pages (dev ブランチ)
+- バックエンド: Supabase (Edge Functions, Vault, RLS, Realtime)
+- IMAP: 本文取得は `_shared/raw-imap.ts` に一本化 (imapflow は hang するため不使用)
+- SMTP: `nodemailer`
+- IDLE: Xserver VPS 上の Node.js + imapflow コンテナ（`idle-worker/`）
+- 認証: Supabase Auth (ES256)、Edge Functions は `verify_jwt = false` + 各関数で `auth.getUser(token)` 認可
 
-### Hang の発生パターン
-1. 接続・認証・SELECT INBOX・SEARCH `{all: true}`・SEARCH `{uid: 'X:Y'}` はすべて動く。
-2. fetch 系を呼ぶと 1 通返ってきた直後に次の応答を待って hang する。
-   - `client.fetch(range, {source: true, ...})` でも
-   - `client.fetchOne(uid, {source: true, ...})` でも同じ。
-3. `source: true` を外した簡易 fetch (probe 用) は動く。
-4. imapflow のバージョンを `1.0.164` → `1.3.2` に上げても解消せず。
+## 残タスク（優先順）
 
-### 直近のログパターン（再現済）
-```
-[info@yamado.co.jp] FORWARD search 182601:182682
-[info@yamado.co.jp] START mode=forward targetUids=8 firstSyncRange=null exists=25 lastUid=182600 actualMaxUid=182682 oldestSyncedUid=176312
-[info@yamado.co.jp] fetchOne 1/8 uid=182602 begin
-... (以降何も出ず wall-clock 時間切れで shutdown)
-```
+### 1. Sent/Archive フォルダ同期の本体実装（Step 3b/3c）
 
-`begin` の後に `end` が出ないので、imapflow の fetchOne 内部（`UID FETCH uid (BODY[])` の応答待ち）で止まっている。
+スキーマ基盤（`mail.folders` / `messages.folder_id`）は v0.12.0 で投入済み。残りは:
 
-## 次にやるべきこと（優先順）
+- **Step 3b**: `imap-sync` Edge Function を多フォルダループ対応
+  - 起動時に IMAP `LIST` で SPECIAL-USE を取得 → `mail.folders` に upsert（`\Sent` / `\Archive` / `\Trash` / `\Drafts` で role 判定）
+  - folder 単位で UIDVALIDITY + last_uid を管理（現在 `mail.folders` カラム使用）
+  - INBOX 以外も差分同期ループに組み込む
+- **Step 3c**: UI にフォルダナビ追加
+  - アカウント展開時にフォルダ一覧表示（INBOX / Sent / Archive / Trash / ...）
+  - クリックで切替、フォルダ単位の未読カウント
 
-### 同期 hang の突破
-- **案A**: `client.download(uid)` で本文を別コマンドとして取得する方式を試す。`fetch` で envelope のみ取り、`download` で本文ストリームを別途読む。
-- **案B**: `npm:imap` (node-imap) に置き換える。Deno で動くかは未確認。Deno の互換性は落ちるかもしれない。
-- **案C**: Deno の TLS ソケット + 手書き IMAP パーサで最小実装。AUTHENTICATE PLAIN にも対応できるので hikaru.s 問題も同時解決。最大工数。
-- **案D**: 1 通ごとに接続を開き直す（connect → login → select → fetchOne → logout のループ）。確実だが遅い。速度は受容できる範囲（30 通/tick × 60 秒）。
+### 2. VPS IDLE worker の安定化確認（3 日並行運用）
 
-優先度: 案A → 案D → 案C。案A が効けば最小変更で解決。
+- `curl http://127.0.0.1:3099/healthz` で `connected: true` が維持されるか
+- `docker compose logs -f` で `imap client error` や接続リークがないか
+- Xserver のセッション数制限に抵触しないか（現状 5 アカウント × IDLE + Cron + ユーザメーラ）
+- 3 日問題なければ本番運用確定
 
-### hikaru.s@yamado.co.jp の認証問題
-Courier の LOGIN コマンドがパスワード `}` で拒否されるかもしれないため、AUTHENTICATE PLAIN への切替が必要。imapflow は mechanism を強制できないので、raw IMAP（案C）と同時に片付けるのが自然。
+### 3. IDLE への機能拡張（余裕あれば）
 
-### UI 側の積み残し
-- 受信メールのリアルタイム着信通知（Realtime subscription 経由の push）
-- メールボックス構成（Sent / Drafts / Trash / Spam 等）の同期 — `mail.folders` テーブル新設、`client.list()` でフォルダ一覧取得、各フォルダごとに差分同期ループ、`messages.folder_id` 追加、UI にフォルダ切替サイドバー
-- `mail.message_reads` に UPDATE ポリシー追加（現在は insert + ignoreDuplicates で回避中）
+- IDLE → Sent フォルダにも対応（現在 INBOX のみ）
+- `imap-sync` に `?trigger=idle` のログ記録と rate limit (3 秒以内の de-dupe)
 
-### 添付ファイル対応（未実装）
+### 4. その他積み残し
 
-**現状**:
-- スキーマ: `mail.attachments` テーブルは存在（`filename`, `content_type`, `size_bytes`, `storage_path`, `content_id`）
-- 検知: `has_attachments` フラグは `imap-sync` で正しくセット済み
-- 保存: **未実装**（`parsed.attachments[]` は取得されているがループ内で捨てている）
-- UI: **未実装**（メッセージ表示は `body_text` の `<pre>` のみ）
+- スレッド集約の retroactive rebuild 関数（`mail.rebuild_threads()` で既存データを再集約）
+- 全文検索（tsvector）
+- キーボードショートカット（j/k/e/c//）
+- デスクトップ通知 / LINE WORKS Bot 通知（IDLE の新着を push）
+- `hikaru.s@yamado.co.jp` の Courier-IMAP 認証問題（raw IMAP 経由でログインは通っている可能性あり、要確認）
 
-**実装手順**:
+## VPS IDLE worker の運用メモ
 
-1. **Supabase Storage バケット作成**（手動）
-   - バケット名: `mail-attachments`
-   - Public: false（署名付き URL で配信）
-   - RLS: `has_account_access(account_id)` ベースで読み取り許可
+- 配置: `~/dev/taskul-mail/idle-worker/`
+- 起動: `docker compose up -d --build`
+- ログ: `docker compose logs -f`
+- ヘルス: `curl http://127.0.0.1:3099/healthz`
+- 設定: `.env`（`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` のみ必須）
+- 更新フロー: ローカルで実装 → push → VPS で `git pull && docker compose up -d --build`
 
-2. **`imap-sync` で添付アップロード**（`supabase/functions/imap-sync/index.ts`）
-   - `parsed.attachments[]` をループして Storage へ upload
-   - パス: `{account_id}/{message_id}/{random}-{filename}` （同名対策で UUID 前置）
-   - `mail.attachments` へ insert: `filename`, `content_type`, `size_bytes`, `storage_path`, `content_id`
-   - インライン画像（`content_id` あり）は `body_html` の `cid:xxx` を Storage URL に差し替える前処理も検討
-   - サイズ上限（例: 25MB）を超えるものはスキップ+ログ警告
-   - エラー時はメッセージ本体の upsert は成功させる（添付保存失敗でメール取得全体を失敗させない）
+## 作業ログ
 
-3. **送信時の添付対応**（`supabase/functions/send-mail/index.ts` および `compose/+page.svelte`）
-   - Compose 画面にファイル選択 input 追加
-   - Storage の tmp パス（`tmp/{user_id}/{random}-{filename}`）にアップロード
-   - `mail_drafts` に `attachments JSONB`（storage_path の配列）を追加
-   - 送信時に nodemailer の `attachments` オプションに渡す
-   - 送信成功後は tmp パスから正式パスへ move
+### 2026-04-23
 
-4. **UI で添付表示**（`src/routes/+page.svelte`）
-   - メッセージ詳細に添付リストを表示（ファイル名・サイズ・アイコン）
-   - クリックで署名付き URL を取得してダウンロード
-   - 画像はインラインプレビュー（`body_html` 内の `cid:` 参照も展開）
+**実施内容:**
+- Realtime 購読拡張 (`message_reads` / `drafts` / `threads UPDATE`)、タブ未読バッジ追加
+- スレッド集約のフォールバック窓を 14 日 → 72 時間に短縮
+- `mail.folders` テーブル新設 + `messages.folder_id` 追加（Sent/Archive 対応の土台）
+- `docs/idle-design.md` 作成
+- インボックス UI 微調整: 削除ダイアログ廃止、3 カラム幅ドラッグ調整、返信/Claude 行も sticky、社内メモはメモ有り時のみ表示 + 返信行にメモボタン
+- VPS IDLE worker 実装（Node.js + imapflow + Docker Compose）— 本番稼働開始
+- アカウント行の spinner 削除（サイドバー下部に集約）
 
-**優先度**: PoC の業務利用では **添付を見られる**ほうが先。送信時の添付は後回しで OK。
+**バージョン:** `v0.13.1`
 
-**注意**:
-- Storage の容量上限に注意（Supabase Free は 1GB、Pro は 100GB）
-- 自動削除ポリシーが必要になる可能性（古いメールの添付を定期的に削除）
-- ウイルススキャンは PoC では入れない
+**コミット:**
+- `a573afe` fix: [dev] idle-worker TS 型エラー修正 (v0.13.1)
+- `ddebb5a` feat: [dev] VPS IDLE worker 実装 + アカウント行 spinner 削除 (v0.13.0)
+- `9920652` fix: [dev] インボックス UI 微調整 (v0.12.1)
+- `0a09176` feat: [dev] Realtime 拡張 + folders スキーマ + IDLE 設計 (v0.12.0)
 
-## アーキテクチャ状態
-
-- フロント: SvelteKit + Svelte 5 runes、Cloudflare Pages (dev / main 2 ブランチ運用だが main 未作成)
-- バックエンド: Supabase (Edge Functions, Vault, RLS)
-- IMAP: `npm:imapflow@1.3.2` + `mailparser@3.6.9`
-- 認証: Supabase Auth (ES256)。Edge Functions は `verify_jwt = false` で各関数内で `auth.getUser(token)` による認可を行う構成。
-
-## 実行中のパッチ済み問題
-
-| 問題 | 状態 | 備考 |
-|---|---|---|
-| ES256 JWT を Edge Runtime が拒否 | ✅ | `verify_jwt = false` で回避 |
-| Vault パスワードに制御文字が入る | ✅ | `sanitizeSecret` で trim + 制御文字除去 |
-| message_reads upsert の 403 | ✅ | `ignoreDuplicates: true` で INSERT のみ |
-| stored_last_uid > actualMaxUid | ✅ | cap 方式で対処 |
-| アカウント sort_order カラム | ⚠️ | SQL Editor で手動 apply 済み。`supabase db push` は既存 migrations と衝突するため CLI 経由では apply できない |
-
-## 関連コミット（直近）
-
-- `20bf56a` v0.4.3 — SEARCH + fetchOne 方式に統一
-- `b7a9e70` v0.4.2 — SEARCH ベースの backfill 初版
-- `7e1a891` v0.4.0 — backfill 同期モード追加 + 新着アニメ + 未読バッジ
-- `4a63276` v0.4.1 — 未読バッジのリアルタイム減算 + 並び順調整
-- `13519b4` v0.3.1 — message_reads 403 修正
-- `910ed02` v0.3.0 — アカウント UI をリスト化 + D&D
-
-## 検証用コマンド
-
-```bash
-# 単一アカウントで同期テスト
-curl -X POST "https://ynzpjdarpfaurzomrddu.supabase.co/functions/v1/imap-sync?account_id=8845aea8-98a3-4ecb-9660-55f0e6daf518" --max-time 60
-
-# ログ確認は Supabase Dashboard → Functions → imap-sync → Logs
-# Filter: `[info@yamado.co.jp]`、Level: All
-```
+**残作業:**
+- Sent/Archive フォルダ同期の本体（imap-sync 多フォルダ + UI フォルダナビ）
+- VPS IDLE の 3 日並行運用で安定確認
+- 既存メッセージのスレッド再集約関数
 
 ## テストチェックリスト
 
@@ -138,15 +97,23 @@ curl -X POST "https://ynzpjdarpfaurzomrddu.supabase.co/functions/v1/imap-sync?ac
 - [ ] アカウントを D&D で並び替えてリロード後も順序が維持される
 - [ ] アカウントの右端に未読件数バッジが表示される
 - [ ] 共有アカウントに「共」バッジが表示される
-- [ ] メッセージを開くとアカウント・スレッドの未読カウントが即減算される
-- [ ] 受信トレイでメール本文上部のツールバー（返信 / 全員返信 / 転送 / Claude 下書き）が動作する
+- [ ] 3 カラムそれぞれの幅をドラッグで変更、リロード後も維持される
+- [ ] 返信/Claude 下書き行もヘッダとして固定される
+- [ ] メモがある時だけメモパネルが表示される、返信行の「メモ」ボタンで開閉できる
+- [ ] タブタイトルに未読数が出る（`(N) taskul-mail`）
 - [ ] スレッドの新着がアニメーション付きで出現する
 
 ### 同期
-- [ ] 受信トレイを開いた状態で 60 秒後に新着が取り込まれる
+- [ ] Cron (5 分毎) で新着が取り込まれる
+- [ ] VPS IDLE worker 稼働時、新着メール受信から 3 秒以内に UI 反映
 - [ ] タブ復帰時に即同期される
-- [ ] 過去メールが徐々に遡って取り込まれる（backfill） ← **現在 NG**
 - [ ] 各アカウントの同期が他アカウントの失敗に引きずられない
+- [ ] 添付ファイルが Storage に保存され UI からダウンロードできる
+
+### Realtime
+- [ ] 別ブラウザで既読にすると反対側の未読カウントが 1 秒以内に減る
+- [ ] 別端末で下書き作成すると drafts 表示が即反映される
+- [ ] ゴミ箱移動が他端末に即反映される（15 秒 poll 待ち不要）
 
 ### アカウント管理
 - [ ] アカウント追加フォームから登録できる
@@ -158,3 +125,10 @@ curl -X POST "https://ynzpjdarpfaurzomrddu.supabase.co/functions/v1/imap-sync?ac
 - [ ] Claude 下書き生成でトーン指示を付けられる
 - [ ] 下書き保存・送信ができる
 - [ ] 送信後にスレッド詳細が更新される
+
+### VPS IDLE worker
+- [ ] `docker compose ps` で稼働確認
+- [ ] `curl http://127.0.0.1:3099/healthz` で全アカウント `connected: true`
+- [ ] ログに `EXISTS push received` → `imap-sync triggered` が 3 秒以内で連続出力
+- [ ] 24 分経過後も `noop` が成功している（接続健全性）
+- [ ] VPS 再起動後も `unless-stopped` で自動復旧
