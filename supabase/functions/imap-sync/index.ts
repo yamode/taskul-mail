@@ -78,6 +78,66 @@ function snippetOf(text: string | undefined): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 200);
 }
 
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(label)), ms);
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
+  });
+}
+
+/** 案A: 本文を UID FETCH BODY[] ではなく `download()` (IMAP 内部的には BODY.PEEK[]) で
+ *  別コマンド扱いで取得する。`fetchOne({source:true})` が Courier 上で 1 通目の応答後に
+ *  次の応答を待って永久停止する現象を回避するための主経路。 */
+async function downloadSource(client: ImapFlow, uid: number): Promise<Uint8Array> {
+  const dl = await client.download(String(uid), undefined, { uid: true });
+  if (!dl || !dl.content) throw new Error("download returned no content");
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of dl.content as AsyncIterable<Uint8Array>) {
+    const b = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk as ArrayBuffer);
+    chunks.push(b);
+    total += b.byteLength;
+  }
+  if (total === 0) throw new Error("download returned empty stream");
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.byteLength; }
+  return out;
+}
+
+/** 案D: 該当 UID だけのために新規接続を張って fetch する。
+ *  既存セッションの FETCH 応答待ちで詰まっている場合でも、新しいソケットなら
+ *  初回応答は返ってくるという経験則に基づく last resort。1 通あたり 2〜3 秒掛かる。 */
+async function fetchSourceViaReconnect(
+  account: AccountRow,
+  password: string,
+  uid: number,
+): Promise<Uint8Array | null> {
+  const client = new ImapFlow({
+    host: account.imap_host,
+    port: account.imap_port,
+    secure: true,
+    auth: { user: account.username, pass: password },
+    logger: false,
+  });
+  await client.connect();
+  const lock = await client.getMailboxLock("INBOX");
+  try {
+    const msg = await client.fetchOne(
+      String(uid),
+      { uid: true, source: true },
+      { uid: true },
+    );
+    return (msg as { source?: Uint8Array } | null)?.source ?? null;
+  } finally {
+    lock.release();
+    try { await client.logout(); } catch { /* ignore */ }
+  }
+}
+
 async function syncOneAccount(account: AccountRow): Promise<Record<string, unknown>> {
   const sb = adminClient();
   const password = await readSecret(sb, account.password_secret_id);
@@ -242,34 +302,39 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
 
     // 2 段フェッチ:
     //   Phase 1: envelope + size + internalDate (15s) — 本文を含まないので軽量
-    //   Phase 2: size <= MAX_SOURCE_SIZE なら source (45s)、超えていたら envelope-only で挿入
-    //   Phase 2 が timeout した場合も envelope-only で挿入 (本文取得失敗でも件名/送信者は記録)
+    //   Phase 2: size <= MAX_SOURCE_SIZE なら download() で本文取得 (45s)
+    //            超えていたら envelope-only、download が timeout したら案D (単発再接続) で再試行
+    //   どれも駄目なら envelope-only で挿入 (件名/送信者だけでも残す)
     // 連続 envelope 失敗は接続異常の可能性が高いので 3 件で run を打ち切る。
-    // スキップした UID は maxSeenUid に反映して last_uid を前進させる。
+    // download() が一度でも失敗したら共有セッションが詰まっている可能性が高いので、
+    // 以降の UID は envelope の後いきなり案D (再接続) に回す (reconnectOnly)。
     const ENVELOPE_TIMEOUT_MS = 15_000;
     const SOURCE_TIMEOUT_MS = 45_000;
+    const RECONNECT_TIMEOUT_MS = 30_000;
     const MAX_SOURCE_SIZE = 20 * 1024 * 1024; // 20MB
     const MAX_CONSECUTIVE_SKIPS = 3;
     const skippedUids: number[] = [];
+    let reconnectOnly = false;
+    let downloadUsed = 0;
+    let reconnectUsed = 0;
     const fetchIter = (async function* () {
       let consecutiveSkips = 0;
       for (let i = 0; i < targetUids.length; i++) {
         const uid = targetUids[i];
-        console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} begin`);
+        console.log(`[${account.email_address}] fetch ${i + 1}/${targetUids.length} uid=${uid} begin (reconnectOnly=${reconnectOnly})`);
 
         // Phase 1: envelope (fast)
         let meta: Record<string, unknown> | null = null;
         try {
-          meta = await Promise.race([
+          meta = await withTimeout(
             client.fetchOne(
               String(uid),
               { uid: true, envelope: true, internalDate: true, size: true },
               { uid: true },
-            ),
-            new Promise<never>((_, rej) =>
-              setTimeout(() => rej(new Error(`envelope_timeout uid=${uid}`)), ENVELOPE_TIMEOUT_MS),
-            ),
-          ]) as Record<string, unknown> | null;
+            ) as Promise<Record<string, unknown> | null>,
+            ENVELOPE_TIMEOUT_MS,
+            `envelope_timeout uid=${uid}`,
+          );
         } catch (e) {
           console.warn(`[${account.email_address}] envelope fetch uid=${uid} FAILED: ${(e as Error).message}`);
           skippedUids.push(uid);
@@ -289,28 +354,49 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
         }
 
         const msgSize = Number((meta as { size?: unknown }).size ?? 0);
-        console.log(`[${account.email_address}] fetchOne ${i + 1}/${targetUids.length} uid=${uid} envelope ok size=${msgSize}`);
+        console.log(`[${account.email_address}] fetch ${i + 1}/${targetUids.length} uid=${uid} envelope ok size=${msgSize}`);
 
-        // Phase 2: source (skip if too large or on timeout)
-        if (msgSize > 0 && msgSize <= MAX_SOURCE_SIZE) {
-          try {
-            const full = await Promise.race([
-              client.fetchOne(
-                String(uid),
-                { uid: true, source: true },
-                { uid: true },
-              ),
-              new Promise<never>((_, rej) =>
-                setTimeout(() => rej(new Error(`source_timeout uid=${uid}`)), SOURCE_TIMEOUT_MS),
-              ),
-            ]) as { source?: Uint8Array } | null;
-            if (full?.source) (meta as { source?: Uint8Array }).source = full.source;
-          } catch (e) {
-            console.warn(`[${account.email_address}] source fetch uid=${uid} FAILED: ${(e as Error).message} — using envelope-only`);
-            // envelope-only で yield して挿入
-          }
-        } else if (msgSize > MAX_SOURCE_SIZE) {
+        // Phase 2: body source
+        if (msgSize > MAX_SOURCE_SIZE) {
           console.warn(`[${account.email_address}] uid=${uid} size=${msgSize} exceeds ${MAX_SOURCE_SIZE} — using envelope-only`);
+        } else if (msgSize > 0) {
+          let source: Uint8Array | null = null;
+
+          // 案A: download() でストリーミング取得
+          if (!reconnectOnly) {
+            try {
+              source = await withTimeout(
+                downloadSource(client, uid),
+                SOURCE_TIMEOUT_MS,
+                `download_timeout uid=${uid}`,
+              );
+              downloadUsed++;
+              console.log(`[${account.email_address}] download uid=${uid} ok bytes=${source.byteLength}`);
+            } catch (e) {
+              console.warn(`[${account.email_address}] download uid=${uid} FAILED: ${(e as Error).message} — falling back to reconnect`);
+              // この後は共有セッションが使えない可能性が高いので reconnect 経路に固定
+              reconnectOnly = true;
+            }
+          }
+
+          // 案D: 単発再接続
+          if (!source) {
+            try {
+              source = await withTimeout(
+                fetchSourceViaReconnect(account, password, uid),
+                RECONNECT_TIMEOUT_MS,
+                `reconnect_timeout uid=${uid}`,
+              );
+              if (source) {
+                reconnectUsed++;
+                console.log(`[${account.email_address}] reconnect uid=${uid} ok bytes=${source.byteLength}`);
+              }
+            } catch (e) {
+              console.warn(`[${account.email_address}] reconnect uid=${uid} FAILED: ${(e as Error).message} — envelope-only`);
+            }
+          }
+
+          if (source) (meta as { source?: Uint8Array }).source = source;
         }
 
         consecutiveSkips = 0;
@@ -517,7 +603,12 @@ async function syncOneAccount(account: AccountRow): Promise<Record<string, unkno
     diag.processed = processed;
     diag.hit_limit = processed >= MAX_PER_RUN;
     diag.max_seen_uid = maxSeenUid;
-    console.log(`[${account.email_address}] DONE processed=${processed} maxSeenUid=${maxSeenUid}`);
+    diag.download_used = downloadUsed;
+    diag.reconnect_used = reconnectUsed;
+    diag.reconnect_only = reconnectOnly;
+    console.log(
+      `[${account.email_address}] DONE processed=${processed} maxSeenUid=${maxSeenUid} download=${downloadUsed} reconnect=${reconnectUsed}`,
+    );
   } finally {
     lock.release();
     try { await client.logout(); } catch { /* ignore */ }
