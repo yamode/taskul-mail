@@ -19,3 +19,6 @@ verify_jwt = false
 
 [functions.generate-draft]
 verify_jwt = false
+
+[functions.imap-trash]
+verify_jwt = false

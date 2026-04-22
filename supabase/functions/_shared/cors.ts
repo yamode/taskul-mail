@@ -8,7 +8,8 @@ const ALLOWED_ORIGINS = [
   "http://localhost:5173",                         // vite dev
   "http://localhost:4173",                         // vite preview
   "https://taskul-mail.pages.dev",                 // CF Pages production
-  "https://mail.yamado.co.jp",                     // 本番カスタムドメイン
+  "https://mail.yamado.co.jp",                     // 旧本番カスタムドメイン (暫定維持)
+  "https://taskul-mail.yamado.app",                // 本番カスタムドメイン
 ];
 
 function originAllowed(origin: string | null): string {
