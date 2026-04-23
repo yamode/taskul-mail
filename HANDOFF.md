@@ -1,6 +1,25 @@
 # HANDOFF.md — taskul-mail
 
-> **最終更新**: 2026-04-23（v0.17.0: Sent/Archive 本体同期 Step 3b / dev のみ）
+> **最終更新**: 2026-04-23（v0.18.0: フォルダナビ UI Step 3c / dev のみ）
+
+## v0.18.0 — フォルダナビ UI（Step 3c / dev）
+
+アカウントを選択するとその下に「📥 受信トレイ / 📤 送信済み / 🗂 アーカイブ」のフォルダタブが出現する。
+
+**実装ポイント**
+- `foldersByAccount: Record<account_id, Folder[]>` をアプリ起動時 + 同期完了後に `mail.folders` から再読込
+- `filterFolderId` を state で保持。`selectAccount` 時に localStorage (`taskul-mail.filter-folder-id:{account_id}`) から復元、無ければ inbox role のフォルダをデフォルト選択
+- スレッド一覧は `threadFoldersById: Record<thread_id, Set<folder_id>>` を `applyThreads` で組み立て、`filterFolderId` が空でなければフィルタ
+- 未読カウントはメッセージ単位に `folder_id` を見て集計、各フォルダ行右端に赤バッジ表示
+- drafts / trash / junk は現状表示しない (`imap-sync` の SYNCABLE_ROLES と一致)
+
+**必要なデプロイ**
+- なし (フロントのみ。Cloudflare Pages の dev ブランチ auto-deploy)
+
+**未実装 / 次**
+- Sent 表示時の件名列ラベル: `to_addresses` ベースの「宛先表示」に切替 (現状は from_name のまま)
+- フォルダごとの「新規作成」や「メール移動」操作
+- Drafts / Trash / Junk の同期・表示
 
 ## v0.17.0 — Sent / Archive フォルダ本体同期（Step 3b / dev）
 
@@ -98,14 +117,13 @@ taskul-mail で既読化したメッセージを IMAP サーバ側にも `\Seen`
 
 ## 残タスク（優先順）
 
-### 1. Sent/Archive UI フォルダナビ（Step 3c）
+### 1. Sent フォルダ向け表示の最適化
 
-Step 3b (v0.17.0) で imap-sync の多フォルダ同期は入った。残り:
+v0.18.0 でフォルダナビは入ったが、Sent 閲覧時の体験はまだ「受信トレイ基準」のまま:
 
-- **Step 3c**: UI にフォルダナビ追加
-  - アカウント展開時にフォルダ一覧表示（INBOX / Sent / Archive / Trash / ...）
-  - クリックで切替、フォルダ単位の未読カウント
-  - Sent 側の表示は direction='outbound' のメッセージを to_addresses ベースで表示する想定
+- Sent スレッドでは件名横の青ラベルを送信先 (to_addresses[0]) にする
+- outbound メッセージの未読判定は不要 (いま unread_count は inbound のみ数えているので実害なし、ただ UI 整理の余地あり)
+- Drafts / Trash / Junk フォルダの本体同期・表示 (現状 SYNCABLE_ROLES から除外)
 
 ### 2. VPS IDLE worker の安定化確認（3 日並行運用）
 

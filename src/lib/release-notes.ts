@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.18.0",
+    date: "2026-04-23",
+    changes: [
+      "フォルダナビ追加 (Step 3c): アカウントを選択すると受信トレイ / 送信済み / アーカイブの切替ボタンが出現。フォルダごとの未読バッジも表示",
+      "選択したフォルダはアカウント別に localStorage に保存され、再訪時も維持される",
+      "スレッド一覧は選択中フォルダのメッセージを持つスレッドだけにフィルタされる",
+    ],
+  },
+  {
     version: "0.17.0",
     date: "2026-04-23",
     changes: [

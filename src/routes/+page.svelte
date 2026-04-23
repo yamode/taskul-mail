@@ -42,6 +42,13 @@
     attachments?: Attachment[];
   };
   type Account = { id: string; label: string; is_shared: boolean; sort_order?: number; default_tone?: string; unread_count?: number };
+  type Folder = {
+    id: string;
+    account_id: string;
+    name: string;
+    role: string; // inbox / sent / archive / drafts / trash / junk / other
+    unread_count?: number;
+  };
   type Comment = {
     id: string;
     message_id: string;
@@ -69,7 +76,12 @@
 
   let threads = $state<Thread[]>([]);
   let accounts = $state<Account[]>([]);
+  let foldersByAccount = $state<Record<string, Folder[]>>({});
+  // スレッドがどのフォルダに属するメッセージを持っているかのマップ。Step 3c で folder filter 用。
+  let threadFoldersById = $state<Record<string, Set<string>>>({});
   let filterAccountId = $state<string>("");
+  // フォルダフィルタ (アカウント単位で状態を保持)。"" は「すべて」= アカウント内全フォルダ。
+  let filterFolderId = $state<string>("");
   // 詳細ペインの表示モード: 受信トレイ / 下書き一覧
   let view = $state<"inbox" | "drafts">("inbox");
   let selectedThreadId = $state<string | null>(null);
@@ -164,9 +176,12 @@
   let searchQuery = $derived(($page.url.searchParams.get("q") ?? "").trim().toLowerCase());
 
   let filtered = $derived.by(() => {
-    const base = filterAccountId
+    let base = filterAccountId
       ? threads.filter((t) => t.account_id === filterAccountId)
       : [];
+    if (filterFolderId) {
+      base = base.filter((t) => threadFoldersById[t.id]?.has(filterFolderId));
+    }
     if (!searchQuery) return base;
     return base.filter((t) => {
       const hay = [
@@ -259,6 +274,7 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setAcctSync(accountId, { syncing: false, lastSyncedAt: Date.now(), error: null });
       // 完了ごとに threads を再読込 (他のアカウントを待たずに新着が反映される)
+      await loadFolders();
       await loadThreads();
       if (selectedThreadId) await loadMessages(selectedThreadId);
     } catch (e) {
@@ -422,6 +438,46 @@
       })();
       filterAccountId = (saved && rows.some((a) => a.id === saved)) ? saved : rows[0].id;
     }
+    // 全アカウントのフォルダを一括ロード
+    await loadFolders();
+    restoreFolderSelection();
+  }
+
+  async function loadFolders() {
+    if (accounts.length === 0) { foldersByAccount = {}; return; }
+    const { data } = await mail
+      .from("folders")
+      .select("id,account_id,name,role,hidden,sort_order")
+      .eq("hidden", false)
+      .order("sort_order")
+      .order("name");
+    const byAcc: Record<string, Folder[]> = {};
+    // SYNCABLE_ROLES と同じ優先順位で並べる
+    const roleOrder: Record<string, number> = { inbox: 0, sent: 1, archive: 2, drafts: 3, trash: 4, junk: 5, other: 6 };
+    for (const f of (data ?? []) as Folder[]) {
+      // Step 3c では inbox/sent/archive のみ表示 (drafts/trash/junk はまだ同期対象外)
+      if (!["inbox", "sent", "archive"].includes(f.role)) continue;
+      (byAcc[f.account_id] ??= []).push(f);
+    }
+    for (const list of Object.values(byAcc)) {
+      list.sort((a, b) => (roleOrder[a.role] ?? 99) - (roleOrder[b.role] ?? 99) || a.name.localeCompare(b.name));
+    }
+    foldersByAccount = byAcc;
+  }
+
+  function restoreFolderSelection() {
+    if (!filterAccountId) { filterFolderId = ""; return; }
+    try {
+      const saved = localStorage.getItem(`taskul-mail.filter-folder-id:${filterAccountId}`);
+      const list = foldersByAccount[filterAccountId] ?? [];
+      if (saved && list.some((f) => f.id === saved)) {
+        filterFolderId = saved;
+        return;
+      }
+    } catch { /* ignore */ }
+    // デフォルトは inbox フォルダ (無ければ "" = すべて)
+    const inbox = (foldersByAccount[filterAccountId] ?? []).find((f) => f.role === "inbox");
+    filterFolderId = inbox?.id ?? "";
   }
 
   function selectAccount(id: string) {
@@ -429,6 +485,18 @@
     view = "inbox";
     selectedDraft = null;
     try { localStorage.setItem("taskul-mail.filter-account-id", id); } catch { /* ignore */ }
+    restoreFolderSelection();
+  }
+
+  function selectFolder(folderId: string) {
+    filterFolderId = folderId;
+    view = "inbox";
+    selectedDraft = null;
+    try {
+      if (filterAccountId) {
+        localStorage.setItem(`taskul-mail.filter-folder-id:${filterAccountId}`, folderId);
+      }
+    } catch { /* ignore */ }
   }
 
   // アカウントの未読メールを一斉に既読にする
@@ -703,7 +771,7 @@
       const [{ data: inbound }, { data: reads }] = await Promise.all([
         mail
           .from("messages")
-          .select("id,thread_id,account_id,server_seen,server_deleted_at")
+          .select("id,thread_id,account_id,folder_id,server_seen,server_deleted_at")
           .in("thread_id", threadIds)
           .eq("direction", "inbound")
           .is("server_deleted_at", null),
@@ -714,14 +782,22 @@
       ]);
       const readSet = new Set((reads ?? []).map((r: any) => r.message_id));
       const counts = new Map<string, number>();
+      const perFolder = new Map<string, number>();
       for (const m of (inbound ?? []) as any[]) {
         const isRead = readSet.has(m.id) || m.server_seen === true;
         if (!isRead) {
           counts.set(m.thread_id, (counts.get(m.thread_id) ?? 0) + 1);
           perAccount.set(m.account_id, (perAccount.get(m.account_id) ?? 0) + 1);
+          if (m.folder_id) perFolder.set(m.folder_id, (perFolder.get(m.folder_id) ?? 0) + 1);
         }
       }
       for (const t of base) t.unread_count = counts.get(t.id) ?? 0;
+      // フォルダ未読カウントを反映
+      const updated: Record<string, Folder[]> = {};
+      for (const [accId, list] of Object.entries(foldersByAccount)) {
+        updated[accId] = list.map((f) => ({ ...f, unread_count: perFolder.get(f.id) ?? 0 }));
+      }
+      foldersByAccount = updated;
     }
 
     accounts = accounts.map((a) => ({
@@ -734,20 +810,25 @@
       const threadIds = base.map((t) => t.id);
       const { data: threadMsgs } = await mail
         .from("messages")
-        .select("id,thread_id,from_name,from_address,received_at,has_attachments")
+        .select("id,thread_id,folder_id,from_name,from_address,received_at,has_attachments")
         .in("thread_id", threadIds)
         .is("server_deleted_at", null)
         .order("received_at", { ascending: false });
       const msgToThread = new Map<string, string>();
       const latestByThread = new Map<string, { from_name: string | null; from_address: string | null }>();
       const hasAttByThread = new Set<string>();
+      const foldersByThread: Record<string, Set<string>> = {};
       for (const m of (threadMsgs ?? []) as any[]) {
         msgToThread.set(m.id, m.thread_id);
         if (!latestByThread.has(m.thread_id)) {
           latestByThread.set(m.thread_id, { from_name: m.from_name, from_address: m.from_address });
         }
         if (m.has_attachments) hasAttByThread.add(m.thread_id);
+        if (m.folder_id) {
+          (foldersByThread[m.thread_id] ??= new Set()).add(m.folder_id);
+        }
       }
+      threadFoldersById = foldersByThread;
       // live メッセージが 1 件も無いスレッド (全て server_deleted_at) はリストから除外
       const liveThreadIds = new Set(latestByThread.keys());
       const filtered = base.filter((t) => liveThreadIds.has(t.id));
@@ -1701,6 +1782,26 @@
             onclick={(e) => markAllReadForAccount(a.id, e)}
           >✓✓</button>
         {/if}
+        {#if !accountsCollapsed && filterAccountId === a.id && (foldersByAccount[a.id]?.length ?? 0) > 1}
+          <div class="folder-nav" role="tablist" aria-label="フォルダ">
+            {#each foldersByAccount[a.id] as f (f.id)}
+              <button
+                class="folder-item"
+                class:selected={filterFolderId === f.id}
+                role="tab"
+                aria-selected={filterFolderId === f.id}
+                onclick={() => selectFolder(f.id)}
+                title={f.name}
+              >
+                <span class="folder-icon">{f.role === "sent" ? "📤" : f.role === "archive" ? "🗂" : "📥"}</span>
+                <span class="folder-label">{f.role === "inbox" ? "受信トレイ" : f.role === "sent" ? "送信済み" : f.role === "archive" ? "アーカイブ" : f.name}</span>
+                {#if (f.unread_count ?? 0) > 0}
+                  <span class="folder-unread">{f.unread_count}</span>
+                {/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
       </div>
     {/each}
     <div class="accounts-footer">
@@ -2465,6 +2566,43 @@
     flex-shrink: 0;
   }
   .acct-err:hover { color: #92400e; }
+
+  /* フォルダナビ (Step 3c) */
+  .folder-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    margin: 0.2rem 0 0.3rem 1.4rem;
+    padding-left: 0.4rem;
+    border-left: 2px solid #e5e7eb;
+  }
+  .folder-item {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.3rem 0.5rem;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    font-size: 0.78rem;
+    color: #4b5563;
+    cursor: pointer;
+    text-align: left;
+  }
+  .folder-item:hover { background: #e5e7eb; }
+  .folder-item.selected {
+    background: #fff;
+    border-color: #d1d5db;
+    color: #111;
+    font-weight: 600;
+  }
+  .folder-icon { font-size: 0.85rem; }
+  .folder-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .folder-unread {
+    background: #ef4444; color: #fff; font-size: 0.65rem; font-weight: 700;
+    padding: 0.05rem 0.35rem; border-radius: 8px; min-width: 1.2rem; text-align: center;
+  }
+  .accounts.collapsed .folder-nav { display: none; }
   .accounts-footer { margin-top: auto; padding-top: 0.5rem; }
   .accounts-footer .reload {
     width: 100%;
