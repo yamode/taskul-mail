@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.15.0",
+    date: "2026-04-23",
+    changes: [
+      "他 IMAP クライアントでの既読/削除が taskul-mail にも反映されるように: CONDSTORE (CHANGEDSINCE) でフラグ変化を差分取得、UID 突合で EXPUNGE されたメールを検出",
+      "DB スキーマ: mail.folders.highest_modseq / mail.messages.server_seen / server_deleted_at を追加 (要 migration 20260423000002)",
+      "一覧・スレッド表示が server_deleted_at を除外、未読判定は server_seen も加味",
+    ],
+  },
+  {
     version: "0.14.4",
     date: "2026-04-23",
     changes: [
