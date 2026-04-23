@@ -256,8 +256,8 @@
   //   (a) Supabase Realtime で mail.messages INSERT を購読し、即座に反映
   //   (b) 15 秒ごとに threads テーブルだけを軽量 poll するフォールバック
   //   (c) 60 秒ごとに IMAP sync を実行 (重いので頻度は維持)
-  const IMAP_SYNC_INTERVAL = 60_000;
-  const DB_POLL_INTERVAL = 15_000;
+  const IMAP_SYNC_INTERVAL = 180_000;   // 60s → 180s (DB 過負荷緩和)
+  const DB_POLL_INTERVAL = 120_000;     // 15s → 120s (Realtime 購読で新着は即反映されるのでフォールバック)
   const IMAP_SYNC_TIMEOUT = 45_000;
 
   function setAcctSync(id: string, patch: Partial<AcctSync>) {
