@@ -93,6 +93,25 @@
     return !!m.body_text && m.body_text.startsWith("[本文取得失敗");
   }
 
+  // プレーンテキスト本文内の URL を新タブで開くリンクに変換する。
+  // {@html} で描画するため、先に HTML エスケープしてから URL 部分だけ <a> に置換する。
+  function linkifyPlain(text: string): string {
+    const esc = text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+    // http(s):// と www. を検出。末尾の句読点類は除外
+    return esc.replace(
+      /\b((?:https?:\/\/|www\.)[^\s<>"']+[^\s<>"'.,;:!?)\]】」』])/gi,
+      (url) => {
+        const href = url.startsWith("www.") ? `http://${url}` : url;
+        return `<a href="${href}" target="_blank" rel="noopener noreferrer">${url}</a>`;
+      },
+    );
+  }
+
   // body_html / body_text のどちらも実体がない状態。
   // (mailparser が multipart/alternative + 添付のみのメールで空を返すケース等)
   function bodyIsEmpty(m: Message): boolean {
@@ -2125,10 +2144,10 @@
             {#if mode === "html"}
               <MailHtmlView html={m.body_html} />
             {:else}
-              <pre>{m.body_text ?? ""}</pre>
+              <pre>{@html linkifyPlain(m.body_text ?? "")}</pre>
             {/if}
           {:else}
-            <pre>{m.body_text ?? ""}</pre>
+            <pre>{@html linkifyPlain(m.body_text ?? "")}</pre>
           {/if}
 
           {#if m.attachments && m.attachments.length > 0}
@@ -2559,7 +2578,9 @@
     cursor: pointer;
   }
   .thread-swipe:hover .thread-row { background: #f9fafb; }
-  .thread-row.selected { background: #eff6ff; }
+  .thread-row.selected { background: #bfdbfe; }
+  .thread-swipe:hover .thread-row.selected { background: #bfdbfe; }
+  .thread-row.selected .subject { color: #0b3a82; }
   .thread-row.unread .subject { font-weight: 700; }
   .thread-row.arrived {
     animation: threadArrive 600ms ease-out, threadHighlight 2.8s ease-out 600ms;

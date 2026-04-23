@@ -259,8 +259,18 @@ async function syncOneAccount(
     let rawFetchFail = 0;
 
     // Phase 1: envelope をまとめて取得
+    // envelope 取得に失敗した UID は placeholder メタを合成して envelopes に積む。
+    // こうすることで、その UID は後続の normal フローで「本文なし placeholder メッセージ」
+    // として DB に入り、last_uid も通常通り前進する。UI の「再取得」ボタンで後から本文を
+    // 取りに行ける。以前の実装は skippedUids 経由で last_uid だけ進めていたため、
+    // そのメールが DB に一切残らず永久欠落していた (これが「他メーラーでは受信できるのに
+    // taskul-mail で同期されない」バグの原因)。
     type Meta = Record<string, unknown> & { uid?: number; size?: number };
     const envelopes: Meta[] = [];
+    // 接続死亡時に残りの UID を再試行するためのカーソル。
+    // consecutiveSkips 上限に達したら、ここより手前だけ placeholder で記録し、
+    // それ以降は targetUids から外して next run に持ち越す。
+    let envelopePhaseAbortedAt = -1;
     {
       let consecutiveSkips = 0;
       for (let i = 0; i < targetUids.length; i++) {
@@ -280,22 +290,34 @@ async function syncOneAccount(
         } catch (e) {
           console.warn(`[${account.email_address}] envelope fetch uid=${uid} FAILED: ${(e as Error).message}`);
           skippedUids.push(uid);
+          // envelope 合成: UID だけ持った placeholder。後段で body_text="[本文取得失敗…]" を付ける。
+          envelopes.push({ uid, size: 0, _placeholder: true });
           consecutiveSkips++;
           if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
             console.warn(`[${account.email_address}] ${consecutiveSkips} consecutive envelope skips — aborting envelope phase`);
+            envelopePhaseAbortedAt = i + 1;
             break;
           }
           continue;
         }
         if (!meta) {
           skippedUids.push(uid);
+          envelopes.push({ uid, size: 0, _placeholder: true });
           consecutiveSkips++;
-          if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) break;
+          if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
+            envelopePhaseAbortedAt = i + 1;
+            break;
+          }
           continue;
         }
         consecutiveSkips = 0;
         envelopes.push(meta);
       }
+    }
+    // 接続死亡で中断した場合は、中断位置以降の UID を targetUids から外す
+    // (skippedUids にも placeholder にも登録しないので、next run で通常の forward で拾われる)。
+    if (envelopePhaseAbortedAt >= 0) {
+      targetUids = targetUids.slice(0, envelopePhaseAbortedAt);
     }
 
     // Phase 2: サイズ上限以下の UID を 1 セッションで連続取得
@@ -387,8 +409,23 @@ async function syncOneAccount(
         };
         console.log(`[${account.email_address}] envelope-only uid=${msg.uid}`);
       } else {
-        console.warn(`[${account.email_address}] uid=${msg.uid} has neither source nor envelope — skip`);
-        continue;
+        // envelope も source も無い = Phase 1 で envelope 取得失敗した placeholder。
+        // 件名・送信者不明のまま「再取得」可能な形で DB に残す。これにより last_uid が
+        // 正しく前進し、このメールが永久欠落することを防ぐ。
+        console.warn(`[${account.email_address}] uid=${msg.uid} placeholder insert (envelope failed)`);
+        parsed = {
+          messageId: null,
+          inReplyTo: null,
+          references: [],
+          from: undefined,
+          to: undefined,
+          cc: undefined,
+          subject: null,
+          text: "[本文取得失敗 — envelope 取得タイムアウト。「🔄 本文を再取得」で再試行してください]",
+          html: null,
+          date: msg.internalDate ? new Date(msg.internalDate as string | Date) : new Date(),
+          attachments: [],
+        };
       }
 
       const messageId = parsed.messageId ?? null;
@@ -410,7 +447,13 @@ async function syncOneAccount(
         : [];
 
       // スレッド解決
-      const subjectNorm = normalizeSubject(parsed.subject);
+      // placeholder (envelope 取得失敗) は件名も Message-ID も無いので、既存スレッドとの
+      // 誤マージを防ぐため subject-match フォールバックをスキップし、専用の件名で
+      // 独立スレッドを作る。後で再取得に成功すると upsert が正しい thread_id に差し替える。
+      const isPlaceholder = parsed.subject == null && parsed.messageId == null && !parsed.from;
+      const subjectNorm = isPlaceholder
+        ? `__placeholder__ uid=${msg.uid}`
+        : normalizeSubject(parsed.subject);
       let threadId: string | null = null;
 
       const refKeys = [inReplyTo, ...references].filter(Boolean) as string[];
@@ -426,7 +469,7 @@ async function syncOneAccount(
         if (existing?.thread_id) threadId = existing.thread_id;
       }
 
-      if (!threadId) {
+      if (!threadId && !isPlaceholder) {
         // References/In-Reply-To でヒットしない場合のフォールバック:
         // 同件名で直近 72 時間以内のスレッドに合流、なければ新規
         // (14 日窓では「本日のご予約について」など頻出件名が誤結合するため 72h に縮小)
@@ -464,6 +507,23 @@ async function syncOneAccount(
           if (tErr) throw tErr;
           threadId = created!.id;
         }
+      }
+
+      // placeholder の場合: refKeys でも解決できなかったら新規スレッドを作る (subject 合流はしない)
+      if (!threadId && isPlaceholder) {
+        const { data: created, error: tErr } = await sb
+          .from("threads")
+          .insert({
+            account_id: account.id,
+            subject_normalized: subjectNorm,
+            participants: [],
+            last_message_at: (parsed.date ?? new Date()).toISOString(),
+            message_count: 0,
+          })
+          .select("id")
+          .single();
+        if (tErr) throw tErr;
+        threadId = created!.id;
       }
 
       console.log(`[${account.email_address}] thread resolved uid=${msg.uid}`);
@@ -601,17 +661,11 @@ async function syncOneAccount(
     }
     console.log(`[${account.email_address}] FETCH LOOP DONE processed=${processed} skipped=${skippedUids.length}`);
 
-    // スキップした UID も maxSeenUid に反映 (forward / first モード)。
-    // こうしないと next run で同じ UID を再試行して永久ループするため。
-    // backfill モードは oldestSyncedUid より古い UID なので last_uid には影響させない。
-    // refetch モードも last_uid を動かさない (単発再取得なので既存状態を保つ)。
-    if (mode !== "backfill" && mode !== "refetch" && skippedUids.length > 0) {
-      const maxSkipped = Math.max(...skippedUids);
-      if (maxSkipped > maxSeenUid) {
-        console.warn(`[${account.email_address}] advancing maxSeenUid past skipped UIDs: ${maxSeenUid} -> ${maxSkipped}`);
-        maxSeenUid = maxSkipped;
-      }
-    }
+    // NOTE: 以前はここで `maxSeenUid = max(maxSeenUid, max(skippedUids))` と
+    // last_uid を強制前進させていたが、これが「envelope 1 回失敗 → そのメールが永久欠落」
+    // のバグの直接の原因だった。現在は envelope 失敗 UID は placeholder メッセージを
+    // 挿入して通常フローで processed に含めるので、last_uid は placeholder upsert 経由で
+    // 自然に前進する (skippedUids は診断ログ用)。
 
     // 触ったスレッドの message_count と last_message_at をまとめて更新
     for (const [tid, lastAt] of touchedThreads) {

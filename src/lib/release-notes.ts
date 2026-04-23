@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.14.4",
+    date: "2026-04-23",
+    changes: [
+      "同期の取りこぼし修正: envelope 取得が一時タイムアウトした UID が永久欠落していた不具合を解消。失敗 UID は「[本文取得失敗]」の placeholder として DB に記録され、🔄 再取得ボタンから復旧可能に",
+      "選択中メールのハイライトを濃色化 (#eff6ff → #bfdbfe) し視認性向上",
+      "プレーンテキスト本文中の URL を自動リンク化。クリックで新しいタブで開く",
+    ],
+  },
+  {
     version: "0.14.0",
     date: "2026-04-23",
     changes: [
