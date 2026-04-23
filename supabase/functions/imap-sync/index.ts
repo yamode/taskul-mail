@@ -1,11 +1,13 @@
 // supabase/functions/imap-sync/index.ts
-// 全アカウントの IMAP 受信メールを差分同期する。
+// 複数 IMAP フォルダ (INBOX / Sent / Archive) を差分同期する。
 // Cron (5 分毎) から呼ばれる想定。
 //
-// 差分同期戦略:
-//   - UIDVALIDITY が変わっていたら last_uid = 0 にリセット
+// 差分同期戦略 (フォルダ単位):
+//   - mail.folders.uidvalidity が変わっていたら last_uid = 0 にリセット
 //   - そうでなければ last_uid + 1 以降の UID を取得
 //   - message-id + in-reply-to/references で既存スレッドに合流
+//
+// Step 3b: 多フォルダ対応。各フォルダが独自の UIDVALIDITY / last_uid / highest_modseq を持つ。
 
 import { ImapFlow } from "npm:imapflow@1.3.2";
 import { simpleParser } from "npm:mailparser@3.6.9";
@@ -15,9 +17,10 @@ import { handlePreflight, jsonResponse } from "../_shared/cors.ts";
 import { fetchSourcesRawImap } from "../_shared/raw-imap.ts";
 
 const ATTACHMENTS_BUCKET = "mail-attachments";
+// 同期対象のフォルダ role。drafts/trash/junk は本体同期しない (不要/副作用回避)。
+const SYNCABLE_ROLES = new Set(["inbox", "sent", "archive"]);
 
 function safeFilename(name: string): string {
-  // Supabase Storage のキーとして安全な形に。日本語は保持、空白・記号の一部だけ除去。
   return (name || "attachment")
     .replace(/[\x00-\x1f\x7f/\\]/g, "_")
     .slice(0, 180);
@@ -32,6 +35,15 @@ type AccountRow = {
   password_secret_id: string;
   last_uid: number;
   last_uidvalidity: number | null;
+};
+
+type FolderRow = {
+  id: string;
+  name: string;
+  role: string;
+  uidvalidity: number | null;
+  last_uid: number;
+  highest_modseq: number | null;
 };
 
 function normalizeSubject(s: string | undefined): string {
@@ -54,136 +66,54 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
-// 本文取得は ../_shared/raw-imap.ts の fetchSourceRawImap に一本化した。
-// imapflow の download() / fetchOne({source:true}) は Courier-IMAP 上で hang するため使わない。
+type FolderDiag = Record<string, unknown>;
 
-async function syncOneAccount(
+/**
+ * フォルダ 1 つを同期する。呼び出し側で既に ImapFlow.connect() 済みであること。
+ * folder.role に応じて direction と書き戻し先が変わる:
+ *   - inbox/archive → direction='inbound'、inbox のみ accounts 側も mirror update
+ *   - sent → direction='outbound'
+ * forceUid は inbox にのみ適用 (UI の「本文再取得」は INBOX のみ)。
+ */
+async function syncOneFolder(
+  sb: ReturnType<typeof adminClient>,
+  client: ImapFlow,
   account: AccountRow,
-  forceUid: number | null = null,
-): Promise<Record<string, unknown>> {
-  const sb = adminClient();
-  const password = await readSecret(sb, account.password_secret_id);
-
-  const diag: Record<string, unknown> = {
-    account_last_uid: account.last_uid,
-    account_last_uid_type: typeof account.last_uid,
-    account_last_uidvalidity: account.last_uidvalidity,
-    account_last_uidvalidity_type: typeof account.last_uidvalidity,
-    force_uid: forceUid,
-    imap_logs: [] as string[],
+  folder: FolderRow,
+  password: string,
+  forceUid: number | null,
+): Promise<FolderDiag> {
+  const diag: FolderDiag = {
+    folder_name: folder.name,
+    folder_role: folder.role,
+    folder_last_uid: folder.last_uid,
+    folder_uidvalidity: folder.uidvalidity,
+    folder_highest_modseq: folder.highest_modseq,
   };
-  const imapLogs = diag.imap_logs as string[];
 
-  const client = new ImapFlow({
-    host: account.imap_host,
-    port: account.imap_port,
-    secure: true,
-    auth: { user: account.username, pass: password },
-    logger: {
-      debug: (o: unknown) => imapLogs.push(`DEBUG ${JSON.stringify(o)}`),
-      info: (o: unknown) => imapLogs.push(`INFO  ${JSON.stringify(o)}`),
-      warn: (o: unknown) => imapLogs.push(`WARN  ${JSON.stringify(o)}`),
-      error: (o: unknown) => imapLogs.push(`ERROR ${JSON.stringify(o)}`),
-    },
-  });
+  const isInbox = folder.role === "inbox";
+  const direction = folder.role === "sent" ? "outbound" : "inbound";
+  const effectiveForceUid = isInbox ? forceUid : null;
 
-  try {
-    await client.connect();
-  } catch (e) {
-    (e as { diag?: unknown }).diag = diag;
-    throw e;
-  }
-
-  // フォルダ discovery: IMAP LIST で SPECIAL-USE を取得し mail.folders へ upsert。
-  // INBOX 同期本体は後段の既存ロジックをそのまま使うため、ここは discovery のみ。
-  // Sent/Archive の本体同期 (Step 3c) は別途。
-  try {
-    const list = await client.list() as Array<{
-      path?: string;
-      name?: string;
-      specialUse?: string;
-      flags?: Set<string> | string[];
-    }>;
-    const rows: Array<{ account_id: string; name: string; role: string; special_use: string | null }> = [];
-    for (const entry of list ?? []) {
-      const path = entry.path ?? entry.name;
-      if (!path) continue;
-      const flagSet = entry.flags instanceof Set
-        ? entry.flags
-        : new Set((entry.flags as string[] | undefined) ?? []);
-      const special = entry.specialUse ?? (() => {
-        for (const f of flagSet) {
-          if (/^\\(Sent|Drafts|Trash|Junk|Archive|All|Flagged|Important)$/i.test(f)) return f;
-        }
-        return null;
-      })();
-      let role = "other";
-      if (path.toUpperCase() === "INBOX") role = "inbox";
-      else if (special) {
-        const s = special.toLowerCase();
-        if (s.includes("sent")) role = "sent";
-        else if (s.includes("drafts")) role = "drafts";
-        else if (s.includes("trash")) role = "trash";
-        else if (s.includes("junk")) role = "junk";
-        else if (s.includes("archive") || s.includes("all")) role = "archive";
-      } else {
-        // 名前推定フォールバック (Courier など SPECIAL-USE 未対応サーバ向け)
-        const lower = path.toLowerCase();
-        if (/(^|[./])sent($|[./])/.test(lower) || lower.endsWith("送信済み")) role = "sent";
-        else if (/(^|[./])drafts?($|[./])/.test(lower) || lower.endsWith("下書き")) role = "drafts";
-        else if (/(^|[./])trash($|[./])/.test(lower) || lower.includes("ゴミ箱") || lower.includes("deleted")) role = "trash";
-        else if (/(^|[./])(junk|spam)($|[./])/.test(lower)) role = "junk";
-        else if (/(^|[./])archive($|[./])/.test(lower) || lower.endsWith("アーカイブ")) role = "archive";
-      }
-      rows.push({ account_id: account.id, name: path, role, special_use: special ?? null });
-    }
-    if (rows.length > 0) {
-      const { error: fErr } = await sb
-        .from("folders")
-        .upsert(rows, { onConflict: "account_id,name", ignoreDuplicates: false });
-      if (fErr) console.warn(`[${account.email_address}] folders upsert failed: ${fErr.message}`);
-      else diag.folders_discovered = rows.length;
-    }
-  } catch (e) {
-    console.warn(`[${account.email_address}] LIST discovery failed: ${(e as Error).message}`);
-  }
-
-  // INBOX フォルダ id (messages.folder_id を正しくセットするため必須。
-  // migration 013 以降、unique index は (account_id, folder_id, imap_uid) の
-  // 部分インデックスに変わっているので onConflict も合わせる必要がある)
-  const { data: inboxFolder } = await sb
-    .from("folders")
-    .select("id,highest_modseq")
-    .eq("account_id", account.id)
-    .eq("role", "inbox")
-    .maybeSingle();
-  const inboxFolderId = (inboxFolder as { id?: string } | null)?.id ?? null;
-  const storedHighestModseq = (inboxFolder as { highest_modseq?: number | string | null } | null)?.highest_modseq ?? null;
-  diag.inbox_folder_id = inboxFolderId;
-  diag.stored_highest_modseq = storedHighestModseq;
-
-  const lock = await client.getMailboxLock("INBOX");
-
+  const lock = await client.getMailboxLock(folder.name);
   try {
     const mailbox = client.mailbox;
-    if (typeof mailbox === "boolean") throw new Error("mailbox not open");
+    if (typeof mailbox === "boolean") throw new Error(`mailbox not open: ${folder.name}`);
 
-    // bigint で返ってくる可能性があるので Number に正規化
     const serverUidValidity = Number(mailbox.uidValidity);
-    const storedLastUid = Number(account.last_uid ?? 0);
-    const storedUidValidity = account.last_uidvalidity === null || account.last_uidvalidity === undefined
+    const storedLastUid = Number(folder.last_uid ?? 0);
+    const storedUidValidity = folder.uidvalidity === null || folder.uidvalidity === undefined
       ? null
-      : Number(account.last_uidvalidity);
+      : Number(folder.uidvalidity);
 
     diag.server_uidvalidity = serverUidValidity;
     diag.stored_last_uid = storedLastUid;
     diag.stored_uidvalidity = storedUidValidity;
 
-    // UIDVALIDITY 変化検知
     let fromUid = storedLastUid + 1;
     let effectiveLastUid = storedLastUid;
     if (storedUidValidity !== null && serverUidValidity !== storedUidValidity) {
-      console.warn(`UIDVALIDITY changed for ${account.email_address}, resetting`);
+      console.warn(`[${account.email_address}/${folder.name}] UIDVALIDITY changed, resetting`);
       fromUid = 1;
       effectiveLastUid = 0;
     }
@@ -192,9 +122,6 @@ async function syncOneAccount(
     diag.exists = exists;
     diag.from_uid = fromUid;
 
-    // 末尾メッセージの UID を SEARCH で確認 (以前は for-await の probe fetch を使っていたが、
-    // それが後続の fetchOne を hang させるため SEARCH に置換)。
-    // 全 UID リストを後続の first モードで再利用するため保持。
     let actualMaxUid = 0;
     let allUidsCached: number[] = [];
     if (exists > 0) {
@@ -203,30 +130,29 @@ async function syncOneAccount(
       if (allUidsCached.length > 0) actualMaxUid = Math.max(...allUidsCached);
     }
     diag.actual_max_uid = actualMaxUid;
-    // storedLastUid がサーバの最大 UID を超えていたら (過去バグや手動編集) キャップ
     if (effectiveLastUid > actualMaxUid) {
-      console.warn(`[${account.email_address}] effectiveLastUid(${effectiveLastUid}) > actualMaxUid(${actualMaxUid}), capping`);
+      console.warn(`[${account.email_address}/${folder.name}] effectiveLastUid(${effectiveLastUid}) > actualMaxUid(${actualMaxUid}), capping`);
       effectiveLastUid = actualMaxUid;
       fromUid = actualMaxUid + 1;
     }
 
-    // 1 回あたりの処理上限。Edge Function の wall clock を考慮して抑えめに。
     const MAX_PER_RUN = 30;
     let processed = 0;
     let maxSeenUid = effectiveLastUid;
     const touchedThreads = new Map<string, string>();
 
-    // 同期済みの最古・最新 UID を DB から取得
     const [{ data: oldestRow }, { data: newestRow }] = await Promise.all([
       sb.from("messages")
         .select("imap_uid")
         .eq("account_id", account.id)
+        .eq("folder_id", folder.id)
         .order("imap_uid", { ascending: true })
         .limit(1)
         .maybeSingle(),
       sb.from("messages")
         .select("imap_uid")
         .eq("account_id", account.id)
+        .eq("folder_id", folder.id)
         .order("imap_uid", { ascending: false })
         .limit(1)
         .maybeSingle(),
@@ -236,60 +162,45 @@ async function syncOneAccount(
     diag.oldest_synced_uid = oldestSyncedUid;
     diag.newest_synced_uid = newestSyncedUid;
 
-    // lastUid が 0 にリセットされているが DB にメッセージが存在する場合、
-    // DB の最大 UID を lastUid として採用 (過去の sync が途中で落ちて last_uid が
-    // 更新されなかった場合の自動復旧)。これをやらないと forward search が UID 1 から
-    // スキャンして既に DB にある古い UID を再フェッチし続けてしまう。
     if (effectiveLastUid === 0 && newestSyncedUid !== null) {
-      console.log(`[${account.email_address}] RECOVER lastUid=${newestSyncedUid} from DB`);
+      console.log(`[${account.email_address}/${folder.name}] RECOVER lastUid=${newestSyncedUid} from DB`);
       effectiveLastUid = newestSyncedUid;
       fromUid = newestSyncedUid + 1;
       maxSeenUid = newestSyncedUid;
     }
 
-    // 同期モード判定:
-    // - first: まだ何も同期していない → sequence 末尾から N 件
-    // - forward: 新着あり → SEARCH で UID 列挙
-    // - backfill: 過去メール未取得 → SEARCH で UID 列挙 (新しい順先頭 N 件)
-    // - idle: 同期済み
-    //
-    // 全モードで「対象 UID リストを先に確定 → fetchOne で 1 件ずつ取得」方式にする。
-    // 以前の range fetch (例: 182601:182680) は imapflow の iterator が
-    // 1 件目 upsert 後に次の FETCH 応答を待って永久停止するサーバ挙動で詰まるため。
     let mode: "first" | "forward" | "backfill" | "idle" | "refetch";
     let targetUids: number[] = [];
 
-    if (forceUid !== null) {
-      // 手動再取得: 指定 UID だけを再フェッチ (既存行を upsert で上書き)
+    if (effectiveForceUid !== null) {
       mode = "refetch";
-      targetUids = [forceUid];
-      console.log(`[${account.email_address}] REFETCH uid=${forceUid}`);
+      targetUids = [effectiveForceUid];
+      console.log(`[${account.email_address}/${folder.name}] REFETCH uid=${effectiveForceUid}`);
     } else if (effectiveLastUid === 0 && oldestSyncedUid === null) {
-      // first モードも SEARCH + fetchOne に統一 (range fetch の hang を回避)
       mode = "first";
       if (allUidsCached.length > 0) {
-        const sorted = [...allUidsCached].sort((a, b) => b - a); // 新しい順
+        const sorted = [...allUidsCached].sort((a, b) => b - a);
         targetUids = sorted.slice(0, MAX_PER_RUN).sort((a, b) => a - b);
       }
     } else if (actualMaxUid > effectiveLastUid) {
       mode = "forward";
-      console.log(`[${account.email_address}] FORWARD search ${effectiveLastUid + 1}:${actualMaxUid}`);
+      console.log(`[${account.email_address}/${folder.name}] FORWARD search ${effectiveLastUid + 1}:${actualMaxUid}`);
       const r = await client.search(
         { uid: `${effectiveLastUid + 1}:${actualMaxUid}` },
         { uid: true },
       );
       const uids = (r ?? []).map((u: unknown) => Number(u)).filter((n) => !isNaN(n));
-      uids.sort((a, b) => a - b); // 古い順で順に上書きしやすく
+      uids.sort((a, b) => a - b);
       targetUids = uids.slice(0, MAX_PER_RUN);
     } else if (oldestSyncedUid !== null && oldestSyncedUid > 1) {
       mode = "backfill";
-      console.log(`[${account.email_address}] BACKFILL search 1:${oldestSyncedUid - 1}`);
+      console.log(`[${account.email_address}/${folder.name}] BACKFILL search 1:${oldestSyncedUid - 1}`);
       const r = await client.search(
         { uid: `1:${oldestSyncedUid - 1}` },
         { uid: true },
       );
       const uids = (r ?? []).map((u: unknown) => Number(u)).filter((n) => !isNaN(n));
-      uids.sort((a, b) => b - a); // 新しい順
+      uids.sort((a, b) => b - a);
       targetUids = uids.slice(0, MAX_PER_RUN);
     } else {
       mode = "idle";
@@ -297,41 +208,23 @@ async function syncOneAccount(
     diag.mode = mode;
     diag.target_uid_count = targetUids.length;
 
-    // 2 段フェッチ:
-    //   Phase 1: imapflow で envelope + size + internalDate を UID ごとに軽量取得 (15s/件)
-    //   Phase 2: 生 IMAP (Deno TLS + AUTHENTICATE PLAIN + UID FETCH BODY.PEEK[]) を
-    //            1 セッション内で複数 UID まとめて連続取得。
-    //            imapflow の fetchOne({source:true}) / download() は Courier 上で hang するので使わない。
-    //            UID 1 件ごとの TLS+AUTH+SELECT を繰り返す旧実装は Xserver Courier で頻繁に
-    //            タイムアウトしていたため、接続は 1 回に集約する。
-    //   本文取得失敗時は envelope-only で挿入 (件名/送信者だけでも残す)。
-    // 連続 envelope 失敗は接続異常の可能性が高いので 3 件で envelope phase を打ち切る。
     const ENVELOPE_TIMEOUT_MS = 15_000;
     const SOURCE_PER_UID_TIMEOUT_MS = 45_000;
-    const MAX_SOURCE_SIZE = 25 * 1024 * 1024; // 25MB
+    const MAX_SOURCE_SIZE = 25 * 1024 * 1024;
     const MAX_CONSECUTIVE_SKIPS = 3;
     const skippedUids: number[] = [];
     let rawFetchOk = 0;
     let rawFetchFail = 0;
 
-    // Phase 1: envelope をまとめて取得
-    // envelope 取得に失敗した UID は placeholder メタを合成して envelopes に積む。
-    // こうすることで、その UID は後続の normal フローで「本文なし placeholder メッセージ」
-    // として DB に入り、last_uid も通常通り前進する。UI の「再取得」ボタンで後から本文を
-    // 取りに行ける。以前の実装は skippedUids 経由で last_uid だけ進めていたため、
-    // そのメールが DB に一切残らず永久欠落していた (これが「他メーラーでは受信できるのに
-    // taskul-mail で同期されない」バグの原因)。
+    // Phase 1: envelope
     type Meta = Record<string, unknown> & { uid?: number; size?: number };
     const envelopes: Meta[] = [];
-    // 接続死亡時に残りの UID を再試行するためのカーソル。
-    // consecutiveSkips 上限に達したら、ここより手前だけ placeholder で記録し、
-    // それ以降は targetUids から外して next run に持ち越す。
     let envelopePhaseAbortedAt = -1;
     {
       let consecutiveSkips = 0;
       for (let i = 0; i < targetUids.length; i++) {
         const uid = targetUids[i];
-        console.log(`[${account.email_address}] envelope ${i + 1}/${targetUids.length} uid=${uid} begin`);
+        console.log(`[${account.email_address}/${folder.name}] envelope ${i + 1}/${targetUids.length} uid=${uid} begin`);
         let meta: Meta | null = null;
         try {
           meta = await withTimeout(
@@ -344,13 +237,11 @@ async function syncOneAccount(
             `envelope_timeout uid=${uid}`,
           );
         } catch (e) {
-          console.warn(`[${account.email_address}] envelope fetch uid=${uid} FAILED: ${(e as Error).message}`);
+          console.warn(`[${account.email_address}/${folder.name}] envelope fetch uid=${uid} FAILED: ${(e as Error).message}`);
           skippedUids.push(uid);
-          // envelope 合成: UID だけ持った placeholder。後段で body_text="[本文取得失敗…]" を付ける。
           envelopes.push({ uid, size: 0, _placeholder: true });
           consecutiveSkips++;
           if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
-            console.warn(`[${account.email_address}] ${consecutiveSkips} consecutive envelope skips — aborting envelope phase`);
             envelopePhaseAbortedAt = i + 1;
             break;
           }
@@ -370,26 +261,25 @@ async function syncOneAccount(
         envelopes.push(meta);
       }
     }
-    // 接続死亡で中断した場合は、中断位置以降の UID を targetUids から外す
-    // (skippedUids にも placeholder にも登録しないので、next run で通常の forward で拾われる)。
     if (envelopePhaseAbortedAt >= 0) {
       targetUids = targetUids.slice(0, envelopePhaseAbortedAt);
     }
 
-    // Phase 2: サイズ上限以下の UID を 1 セッションで連続取得
+    // Phase 2: body fetch (raw IMAP batch)
     const bodyTargets = envelopes
       .map((m) => ({ uid: Number(m.uid), size: Number(m.size ?? 0) }))
       .filter((x) => x.uid > 0 && x.size > 0 && x.size <= MAX_SOURCE_SIZE)
       .map((x) => x.uid);
     const sourceMap = new Map<number, Uint8Array>();
     if (bodyTargets.length > 0) {
-      console.log(`[${account.email_address}] raw-imap batch start uids=${bodyTargets.length}`);
+      console.log(`[${account.email_address}/${folder.name}] raw-imap batch start uids=${bodyTargets.length}`);
       const overallTimeout = SOURCE_PER_UID_TIMEOUT_MS * bodyTargets.length + 30_000;
       const batch = await fetchSourcesRawImap({
         host: account.imap_host,
         port: account.imap_port,
         user: account.username,
         pass: password,
+        mailbox: folder.name,
         uids: bodyTargets,
         perUidTimeoutMs: SOURCE_PER_UID_TIMEOUT_MS,
         overallTimeoutMs: overallTimeout,
@@ -400,18 +290,18 @@ async function syncOneAccount(
       }
       for (const [uid, err] of batch.errors) {
         rawFetchFail++;
-        console.warn(`[${account.email_address}] raw-imap batch uid=${uid} FAILED: ${err}`);
+        console.warn(`[${account.email_address}/${folder.name}] raw-imap batch uid=${uid} FAILED: ${err}`);
       }
-      console.log(`[${account.email_address}] raw-imap batch done ok=${batch.sources.size} fail=${batch.errors.size}`);
+      console.log(`[${account.email_address}/${folder.name}] raw-imap batch done ok=${batch.sources.size} fail=${batch.errors.size}`);
     }
 
-    // Phase 3: envelope + source を束ねて逐次処理
+    // Phase 3: parse & upsert
     const fetchIter = (async function* () {
       for (const meta of envelopes) {
         const uid = Number((meta as { uid?: unknown }).uid);
         const msgSize = Number((meta as { size?: unknown }).size ?? 0);
         if (msgSize > MAX_SOURCE_SIZE) {
-          console.warn(`[${account.email_address}] uid=${uid} size=${msgSize} exceeds ${MAX_SOURCE_SIZE} — envelope-only`);
+          console.warn(`[${account.email_address}/${folder.name}] uid=${uid} size=${msgSize} exceeds ${MAX_SOURCE_SIZE} — envelope-only`);
         } else {
           const src = sourceMap.get(uid);
           if (src) (meta as { source?: Uint8Array }).source = src;
@@ -420,24 +310,19 @@ async function syncOneAccount(
       }
     })();
     diag.skipped_uids = skippedUids;
-    console.log(`[${account.email_address}] START mode=${mode} targetUids=${targetUids.length} exists=${exists} lastUid=${effectiveLastUid} actualMaxUid=${actualMaxUid} oldestSyncedUid=${oldestSyncedUid}`);
+    console.log(`[${account.email_address}/${folder.name}] START mode=${mode} targetUids=${targetUids.length} exists=${exists} lastUid=${effectiveLastUid} actualMaxUid=${actualMaxUid} oldestSyncedUid=${oldestSyncedUid}`);
+
     for await (const msg of fetchIter) {
       if (processed >= MAX_PER_RUN) break;
       processed++;
-      console.log(`[${account.email_address}] got msg uid=${msg.uid} bytes=${msg.source?.length ?? 0}`);
-      // source がある場合は mailparser でフルパース。
-      // envelope-only フォールバックの場合は envelope から最小の parsed 相当を構築。
+      console.log(`[${account.email_address}/${folder.name}] got msg uid=${msg.uid} bytes=${msg.source?.length ?? 0}`);
       // deno-lint-ignore no-explicit-any
       let parsed: any;
       if (msg.source) {
-        // mailparser@3.6.9 は Buffer/string/Readable のみ受け付けるため、
-        // download() / fetchOne で返ってくる Uint8Array は Buffer へ包み直す。
-        // (素の Uint8Array を渡すと "input.once is not a function" で落ちる)
         const src = msg.source instanceof Uint8Array && !(msg.source instanceof Buffer)
           ? Buffer.from(msg.source.buffer, msg.source.byteOffset, msg.source.byteLength)
           : msg.source;
         parsed = await simpleParser(src);
-        console.log(`[${account.email_address}] parsed uid=${msg.uid}`);
       } else if (msg.envelope) {
         const env = msg.envelope as {
           date?: Date | string;
@@ -463,12 +348,7 @@ async function syncOneAccount(
           date: env.date ? new Date(env.date) : (msg.internalDate ? new Date(msg.internalDate) : new Date()),
           attachments: [],
         };
-        console.log(`[${account.email_address}] envelope-only uid=${msg.uid}`);
       } else {
-        // envelope も source も無い = Phase 1 で envelope 取得失敗した placeholder。
-        // 件名・送信者不明のまま「再取得」可能な形で DB に残す。これにより last_uid が
-        // 正しく前進し、このメールが永久欠落することを防ぐ。
-        console.warn(`[${account.email_address}] uid=${msg.uid} placeholder insert (envelope failed)`);
         parsed = {
           messageId: null,
           inReplyTo: null,
@@ -502,10 +382,6 @@ async function syncOneAccount(
             .flatMap((x) => x.value.map((v) => v.address).filter(Boolean))
         : [];
 
-      // スレッド解決
-      // placeholder (envelope 取得失敗) は件名も Message-ID も無いので、既存スレッドとの
-      // 誤マージを防ぐため subject-match フォールバックをスキップし、専用の件名で
-      // 独立スレッドを作る。後で再取得に成功すると upsert が正しい thread_id に差し替える。
       const isPlaceholder = parsed.subject == null && parsed.messageId == null && !parsed.from;
       const subjectNorm = isPlaceholder
         ? `__placeholder__ uid=${msg.uid}`
@@ -526,9 +402,6 @@ async function syncOneAccount(
       }
 
       if (!threadId && !isPlaceholder) {
-        // References/In-Reply-To でヒットしない場合のフォールバック:
-        // 同件名で直近 72 時間以内のスレッドに合流、なければ新規
-        // (14 日窓では「本日のご予約について」など頻出件名が誤結合するため 72h に縮小)
         const { data: recent } = await sb
           .from("threads")
           .select("id")
@@ -550,11 +423,7 @@ async function syncOneAccount(
             .insert({
               account_id: account.id,
               subject_normalized: subjectNorm,
-              participants: [
-                fromObj?.address,
-                ...toAddrs,
-                ...ccAddrs,
-              ].filter(Boolean),
+              participants: [fromObj?.address, ...toAddrs, ...ccAddrs].filter(Boolean),
               last_message_at: (parsed.date ?? new Date()).toISOString(),
               message_count: 0,
             })
@@ -565,7 +434,6 @@ async function syncOneAccount(
         }
       }
 
-      // placeholder の場合: refKeys でも解決できなかったら新規スレッドを作る (subject 合流はしない)
       if (!threadId && isPlaceholder) {
         const { data: created, error: tErr } = await sb
           .from("threads")
@@ -582,15 +450,9 @@ async function syncOneAccount(
         threadId = created!.id;
       }
 
-      console.log(`[${account.email_address}] thread resolved uid=${msg.uid}`);
-
-      // 本文補完: body_text / body_html のどちらかが欠落していても表示できるようにする。
-      // - text のみ空 → parsed.textAsHtml or html から推定
-      // - 両方空 → 添付情報を snippet 的に入れる
       let finalText: string | null = parsed.text ?? null;
       let finalHtml: string | null = parsed.html || null;
       if (!finalText && finalHtml) {
-        // HTML しかない場合でも text mode で何か出せるように簡易 strip
         finalText = String(finalHtml)
           .replace(/<style[\s\S]*?<\/style>/gi, "")
           .replace(/<script[\s\S]*?<\/script>/gi, "")
@@ -613,11 +475,10 @@ async function syncOneAccount(
         }
       }
 
-      // メッセージ upsert (重複は (account_id, folder_id, imap_uid) の unique 制約で弾く)
       const { data: upsertedMsg, error: mErr } = await sb.from("messages").upsert(
         {
           account_id: account.id,
-          folder_id: inboxFolderId,
+          folder_id: folder.id,
           thread_id: threadId,
           imap_uid: Number(msg.uid),
           message_id: messageId,
@@ -633,22 +494,18 @@ async function syncOneAccount(
           snippet: snippetOf(finalText ?? undefined),
           received_at: (parsed.date ?? new Date()).toISOString(),
           has_attachments: (parsed.attachments?.length ?? 0) > 0,
-          direction: "inbound",
+          direction,
           raw_headers: {},
         },
         { onConflict: "account_id,folder_id,imap_uid" },
       ).select("id").single();
       if (mErr) {
-        console.error(`[${account.email_address}] message insert failed uid=${msg.uid}`, mErr);
+        console.error(`[${account.email_address}/${folder.name}] message insert failed uid=${msg.uid}`, mErr);
         continue;
       }
       const messageUuid = (upsertedMsg as { id: string } | null)?.id;
-      console.log(`[${account.email_address}] upserted uid=${msg.uid} id=${messageUuid}`);
 
-      // 添付ファイルを Storage にアップロードして mail.attachments へ登録。
-      // 失敗してもメール本体の取得は成功扱いのまま (添付だけ欠落)。
       if (messageUuid && Array.isArray(parsed.attachments) && parsed.attachments.length > 0) {
-        // 同じ UID の再同期時に重複しないよう既存レコードは全消しして入れ直す
         const { data: oldRows } = await sb
           .from("attachments")
           .select("id,storage_path")
@@ -684,7 +541,7 @@ async function syncOneAccount(
               upsert: false,
             });
           if (upErr) {
-            console.warn(`[${account.email_address}] attachment upload failed uid=${msg.uid} name=${filename}: ${upErr.message}`);
+            console.warn(`[${account.email_address}/${folder.name}] attachment upload failed uid=${msg.uid} name=${filename}: ${upErr.message}`);
             continue;
           }
           const { error: aErr } = await sb.from("attachments").insert({
@@ -696,54 +553,33 @@ async function syncOneAccount(
             content_id: att.cid ?? null,
           });
           if (aErr) {
-            console.warn(`[${account.email_address}] attachment row insert failed uid=${msg.uid} name=${filename}: ${aErr.message}`);
+            console.warn(`[${account.email_address}/${folder.name}] attachment row insert failed uid=${msg.uid} name=${filename}: ${aErr.message}`);
           }
         }
       }
 
-      // last_message_at のみ更新 (件数集計は最後にまとめて)
       touchedThreads.set(threadId!, (parsed.date ?? new Date()).toISOString());
 
       if (Number(msg.uid) > maxSeenUid) maxSeenUid = Number(msg.uid);
 
-      // 3 件ごとに last_uid を DB にチェックポイント保存。
-      // 途中で wall-clock shutdown / hang しても次回 sync 時に続きから再開できる。
+      // チェックポイント: 3 件ごとに folder.last_uid を保存
       if (processed % 3 === 0) {
         await sb
-          .from("accounts")
-          .update({ last_uid: maxSeenUid, last_uidvalidity: Number(mailbox.uidValidity) })
-          .eq("id", account.id);
+          .from("folders")
+          .update({ last_uid: maxSeenUid, uidvalidity: serverUidValidity })
+          .eq("id", folder.id);
       }
     }
-    console.log(`[${account.email_address}] FETCH LOOP DONE processed=${processed} skipped=${skippedUids.length}`);
+    console.log(`[${account.email_address}/${folder.name}] FETCH LOOP DONE processed=${processed} skipped=${skippedUids.length}`);
 
-    // NOTE: 以前はここで `maxSeenUid = max(maxSeenUid, max(skippedUids))` と
-    // last_uid を強制前進させていたが、これが「envelope 1 回失敗 → そのメールが永久欠落」
-    // のバグの直接の原因だった。現在は envelope 失敗 UID は placeholder メッセージを
-    // 挿入して通常フローで processed に含めるので、last_uid は placeholder upsert 経由で
-    // 自然に前進する (skippedUids は診断ログ用)。
-
-    // ------------------------------------------------------------
-    // Reconcile phase: 既存メッセージのフラグ同期 + EXPUNGE 検出
-    // ------------------------------------------------------------
-    // 1) CONDSTORE フラグ同期 (RFC 7162):
-    //    前回の HIGHESTMODSEQ 以降にフラグが変わった UID だけを取得し、
-    //    server_seen を更新する。これにより他 IMAP クライアントで既読化された
-    //    メールが taskul-mail でも既読として見えるようになる。
-    // 2) 削除検出:
-    //    server 側の全 UID (allUidsCached) と DB にある UID を突合し、
-    //    DB にあって server に無い UID を server_deleted_at = now() でマーク。
-    //    (DB にあるのに server に無い = 他クライアントで削除/移動された)
-    //    DB にあるがまだ同期していない古い UID は backfill で拾うため、
-    //    「サーバ側に存在する UID 集合」を基準にした差分検出は安全。
-    // ------------------------------------------------------------
+    // Reconcile: CONDSTORE flags + deletion detection
     const serverHighestModseq = Number((mailbox as { highestModseq?: number | string | bigint }).highestModseq ?? 0) || null;
     diag.server_highest_modseq = serverHighestModseq;
     let flagReconcileCount = 0;
     let deletionReconcileCount = 0;
+    const storedHighestModseq = folder.highest_modseq;
 
-    // 1) CONDSTORE フラグ同期
-    if (serverHighestModseq && storedHighestModseq && Number(storedHighestModseq) < serverHighestModseq && inboxFolderId) {
+    if (serverHighestModseq && storedHighestModseq && Number(storedHighestModseq) < serverHighestModseq) {
       try {
         const changed: Array<{ uid: number; seen: boolean }> = [];
         for await (const m of client.fetch(
@@ -762,7 +598,6 @@ async function syncOneAccount(
         }
         diag.changedsince_count = changed.length;
         if (changed.length > 0) {
-          // バッチ更新: 同じ seen 値ごとにまとめて IN (...) で流す
           const seenUids = changed.filter((c) => c.seen).map((c) => c.uid);
           const unseenUids = changed.filter((c) => !c.seen).map((c) => c.uid);
           if (seenUids.length > 0) {
@@ -770,9 +605,9 @@ async function syncOneAccount(
               .from("messages")
               .update({ server_seen: true })
               .eq("account_id", account.id)
-              .eq("folder_id", inboxFolderId)
+              .eq("folder_id", folder.id)
               .in("imap_uid", seenUids);
-            if (uErr) console.warn(`[${account.email_address}] server_seen update failed: ${uErr.message}`);
+            if (uErr) console.warn(`[${account.email_address}/${folder.name}] server_seen update failed: ${uErr.message}`);
             else flagReconcileCount += seenUids.length;
           }
           if (unseenUids.length > 0) {
@@ -780,71 +615,54 @@ async function syncOneAccount(
               .from("messages")
               .update({ server_seen: false })
               .eq("account_id", account.id)
-              .eq("folder_id", inboxFolderId)
+              .eq("folder_id", folder.id)
               .in("imap_uid", unseenUids);
-            if (uErr) console.warn(`[${account.email_address}] server_seen unset failed: ${uErr.message}`);
+            if (uErr) console.warn(`[${account.email_address}/${folder.name}] server_seen unset failed: ${uErr.message}`);
             else flagReconcileCount += unseenUids.length;
           }
         }
       } catch (e) {
-        console.warn(`[${account.email_address}] CONDSTORE reconcile failed: ${(e as Error).message}`);
+        console.warn(`[${account.email_address}/${folder.name}] CONDSTORE reconcile failed: ${(e as Error).message}`);
         diag.condstore_error = (e as Error).message;
       }
     } else if (!serverHighestModseq) {
       diag.condstore_supported = false;
     }
 
-    // 2) 削除検出 (DB にあって server に無い UID)
-    if (inboxFolderId) {
-      try {
-        const serverUidSet = new Set(allUidsCached);
-        // DB の現存 UID を取得 (削除マーク済みは除外)
-        const { data: dbUidRows } = await sb
-          .from("messages")
-          .select("imap_uid")
-          .eq("account_id", account.id)
-          .eq("folder_id", inboxFolderId)
-          .is("server_deleted_at", null);
-        const dbUids = (dbUidRows ?? [])
-          .map((r) => Number((r as { imap_uid?: number }).imap_uid))
-          .filter((n) => Number.isFinite(n) && n > 0);
-        // EXISTS=0 (フォルダ空) は誤検知の危険があるのでスキップ
-        if (exists > 0) {
-          const missing = dbUids.filter((u) => !serverUidSet.has(u));
-          if (missing.length > 0) {
-            // 一気に全部消すと誤動作時のダメージが大きいので 1 回 200 件までに制限
-            const batch = missing.slice(0, 200);
-            const { error: dErr } = await sb
-              .from("messages")
-              .update({ server_deleted_at: new Date().toISOString() })
-              .eq("account_id", account.id)
-              .eq("folder_id", inboxFolderId)
-              .in("imap_uid", batch);
-            if (dErr) console.warn(`[${account.email_address}] server_deleted_at mark failed: ${dErr.message}`);
-            else deletionReconcileCount = batch.length;
-          }
+    try {
+      const serverUidSet = new Set(allUidsCached);
+      const { data: dbUidRows } = await sb
+        .from("messages")
+        .select("imap_uid")
+        .eq("account_id", account.id)
+        .eq("folder_id", folder.id)
+        .is("server_deleted_at", null);
+      const dbUids = (dbUidRows ?? [])
+        .map((r) => Number((r as { imap_uid?: number }).imap_uid))
+        .filter((n) => Number.isFinite(n) && n > 0);
+      if (exists > 0) {
+        const missing = dbUids.filter((u) => !serverUidSet.has(u));
+        if (missing.length > 0) {
+          const batch = missing.slice(0, 200);
+          const { error: dErr } = await sb
+            .from("messages")
+            .update({ server_deleted_at: new Date().toISOString() })
+            .eq("account_id", account.id)
+            .eq("folder_id", folder.id)
+            .in("imap_uid", batch);
+          if (dErr) console.warn(`[${account.email_address}/${folder.name}] server_deleted_at mark failed: ${dErr.message}`);
+          else deletionReconcileCount = batch.length;
         }
-      } catch (e) {
-        console.warn(`[${account.email_address}] deletion reconcile failed: ${(e as Error).message}`);
-        diag.deletion_error = (e as Error).message;
       }
-    }
-
-    // 3) HIGHESTMODSEQ を folders に保存 (次回の CHANGEDSINCE 起点)
-    if (serverHighestModseq && inboxFolderId) {
-      await sb
-        .from("folders")
-        .update({ highest_modseq: serverHighestModseq, last_synced_at: new Date().toISOString() })
-        .eq("id", inboxFolderId);
+    } catch (e) {
+      console.warn(`[${account.email_address}/${folder.name}] deletion reconcile failed: ${(e as Error).message}`);
+      diag.deletion_error = (e as Error).message;
     }
 
     diag.flag_reconcile_count = flagReconcileCount;
     diag.deletion_reconcile_count = deletionReconcileCount;
-    console.log(
-      `[${account.email_address}] RECONCILE flags=${flagReconcileCount} deletions=${deletionReconcileCount} modseq=${serverHighestModseq}`,
-    );
 
-    // 触ったスレッドの message_count と last_message_at をまとめて更新
+    // touchedThreads の件数・last_message_at を更新
     for (const [tid, lastAt] of touchedThreads) {
       const { count } = await sb
         .from("messages")
@@ -856,21 +674,32 @@ async function syncOneAccount(
         .eq("id", tid);
     }
 
-    // アカウントの同期ステート更新 (refetch モードは last_uid を触らない)
-    if (mode === "refetch") {
-      await sb
-        .from("accounts")
-        .update({ last_synced_at: new Date().toISOString() })
-        .eq("id", account.id);
-    } else {
-      await sb
-        .from("accounts")
-        .update({
-          last_uid: maxSeenUid,
-          last_uidvalidity: Number(mailbox.uidValidity),
-          last_synced_at: new Date().toISOString(),
-        })
-        .eq("id", account.id);
+    // folder の同期ステート確定
+    const folderUpdate: Record<string, unknown> = {
+      last_synced_at: new Date().toISOString(),
+      uidvalidity: serverUidValidity,
+    };
+    if (mode !== "refetch") folderUpdate.last_uid = maxSeenUid;
+    if (serverHighestModseq) folderUpdate.highest_modseq = serverHighestModseq;
+    await sb.from("folders").update(folderUpdate).eq("id", folder.id);
+
+    // INBOX は accounts 側も mirror 更新 (既存 UI / IDLE worker との互換維持)
+    if (isInbox) {
+      if (mode === "refetch") {
+        await sb
+          .from("accounts")
+          .update({ last_synced_at: new Date().toISOString() })
+          .eq("id", account.id);
+      } else {
+        await sb
+          .from("accounts")
+          .update({
+            last_uid: maxSeenUid,
+            last_uidvalidity: serverUidValidity,
+            last_synced_at: new Date().toISOString(),
+          })
+          .eq("id", account.id);
+      }
     }
 
     diag.processed = processed;
@@ -879,10 +708,147 @@ async function syncOneAccount(
     diag.raw_fetch_ok = rawFetchOk;
     diag.raw_fetch_fail = rawFetchFail;
     console.log(
-      `[${account.email_address}] DONE processed=${processed} maxSeenUid=${maxSeenUid} rawOk=${rawFetchOk} rawFail=${rawFetchFail}`,
+      `[${account.email_address}/${folder.name}] DONE mode=${mode} processed=${processed} maxSeenUid=${maxSeenUid} rawOk=${rawFetchOk} rawFail=${rawFetchFail} flagReconcile=${flagReconcileCount} deletionReconcile=${deletionReconcileCount}`,
     );
   } finally {
     lock.release();
+  }
+  return diag;
+}
+
+async function syncOneAccount(
+  account: AccountRow,
+  forceUid: number | null = null,
+): Promise<Record<string, unknown>> {
+  const sb = adminClient();
+  const password = await readSecret(sb, account.password_secret_id);
+
+  const diag: Record<string, unknown> = {
+    force_uid: forceUid,
+    imap_logs: [] as string[],
+    folders: {} as Record<string, FolderDiag>,
+  };
+  const imapLogs = diag.imap_logs as string[];
+  const folderDiags = diag.folders as Record<string, FolderDiag>;
+
+  const client = new ImapFlow({
+    host: account.imap_host,
+    port: account.imap_port,
+    secure: true,
+    auth: { user: account.username, pass: password },
+    logger: {
+      debug: (o: unknown) => imapLogs.push(`DEBUG ${JSON.stringify(o)}`),
+      info: (o: unknown) => imapLogs.push(`INFO  ${JSON.stringify(o)}`),
+      warn: (o: unknown) => imapLogs.push(`WARN  ${JSON.stringify(o)}`),
+      error: (o: unknown) => imapLogs.push(`ERROR ${JSON.stringify(o)}`),
+    },
+  });
+
+  try {
+    await client.connect();
+  } catch (e) {
+    (e as { diag?: unknown }).diag = diag;
+    throw e;
+  }
+
+  try {
+    // フォルダ discovery (v0.16.1): LIST → mail.folders upsert
+    try {
+      const list = await client.list() as Array<{
+        path?: string;
+        name?: string;
+        specialUse?: string;
+        flags?: Set<string> | string[];
+      }>;
+      const rows: Array<{ account_id: string; name: string; role: string; special_use: string | null }> = [];
+      for (const entry of list ?? []) {
+        const path = entry.path ?? entry.name;
+        if (!path) continue;
+        const flagSet = entry.flags instanceof Set
+          ? entry.flags
+          : new Set((entry.flags as string[] | undefined) ?? []);
+        const special = entry.specialUse ?? (() => {
+          for (const f of flagSet) {
+            if (/^\\(Sent|Drafts|Trash|Junk|Archive|All|Flagged|Important)$/i.test(f)) return f;
+          }
+          return null;
+        })();
+        let role = "other";
+        if (path.toUpperCase() === "INBOX") role = "inbox";
+        else if (special) {
+          const s = special.toLowerCase();
+          if (s.includes("sent")) role = "sent";
+          else if (s.includes("drafts")) role = "drafts";
+          else if (s.includes("trash")) role = "trash";
+          else if (s.includes("junk")) role = "junk";
+          else if (s.includes("archive") || s.includes("all")) role = "archive";
+        } else {
+          const lower = path.toLowerCase();
+          if (/(^|[./])sent($|[./])/.test(lower) || lower.endsWith("送信済み")) role = "sent";
+          else if (/(^|[./])drafts?($|[./])/.test(lower) || lower.endsWith("下書き")) role = "drafts";
+          else if (/(^|[./])trash($|[./])/.test(lower) || lower.includes("ゴミ箱") || lower.includes("deleted")) role = "trash";
+          else if (/(^|[./])(junk|spam)($|[./])/.test(lower)) role = "junk";
+          else if (/(^|[./])archive($|[./])/.test(lower) || lower.endsWith("アーカイブ")) role = "archive";
+        }
+        rows.push({ account_id: account.id, name: path, role, special_use: special ?? null });
+      }
+      if (rows.length > 0) {
+        const { error: fErr } = await sb
+          .from("folders")
+          .upsert(rows, { onConflict: "account_id,name", ignoreDuplicates: false });
+        if (fErr) console.warn(`[${account.email_address}] folders upsert failed: ${fErr.message}`);
+        else diag.folders_discovered = rows.length;
+      }
+    } catch (e) {
+      console.warn(`[${account.email_address}] LIST discovery failed: ${(e as Error).message}`);
+    }
+
+    // 同期対象フォルダを DB から読む。INBOX が無ければ最低限 seed (初回アカウントの保険)。
+    const { data: folders } = await sb
+      .from("folders")
+      .select("id,name,role,uidvalidity,last_uid,highest_modseq")
+      .eq("account_id", account.id)
+      .eq("hidden", false)
+      .in("role", Array.from(SYNCABLE_ROLES));
+    const folderList = (folders ?? []) as FolderRow[];
+    // role=inbox を先頭に並べて、以降は name 昇順で安定化
+    folderList.sort((a, b) => {
+      if (a.role === "inbox" && b.role !== "inbox") return -1;
+      if (a.role !== "inbox" && b.role === "inbox") return 1;
+      return a.name.localeCompare(b.name);
+    });
+    diag.folders_to_sync = folderList.map((f) => ({ name: f.name, role: f.role }));
+
+    if (folderList.length === 0) {
+      console.warn(`[${account.email_address}] no syncable folders — seeding INBOX`);
+      const { data: seeded } = await sb
+        .from("folders")
+        .upsert(
+          [{ account_id: account.id, name: "INBOX", role: "inbox", last_uid: Number(account.last_uid ?? 0), uidvalidity: account.last_uidvalidity }],
+          { onConflict: "account_id,name", ignoreDuplicates: false },
+        )
+        .select("id,name,role,uidvalidity,last_uid,highest_modseq")
+        .single();
+      if (seeded) folderList.push(seeded as FolderRow);
+    }
+
+    // forceUid 指定時は INBOX 以外をスキップ (UI の「本文再取得」仕様)
+    const targetFolders = forceUid !== null
+      ? folderList.filter((f) => f.role === "inbox")
+      : folderList;
+
+    for (const folder of targetFolders) {
+      try {
+        const fdiag = await syncOneFolder(sb, client, account, folder, password, forceUid);
+        folderDiags[folder.name] = fdiag;
+      } catch (e) {
+        const msg = (e as Error).message;
+        console.error(`[${account.email_address}/${folder.name}] folder sync failed: ${msg}`);
+        folderDiags[folder.name] = { error: msg, folder_role: folder.role };
+        // 次のフォルダへ継続
+      }
+    }
+  } finally {
     try { await client.logout(); } catch { /* ignore */ }
     console.log(`[${account.email_address}] LOGOUT`);
   }
@@ -893,7 +859,6 @@ Deno.serve(async (req) => {
   const pre = handlePreflight(req);
   if (pre) return pre;
 
-  // 単発アカウント指定 or 全件。force_uid=<N> 指定時はその UID だけ再取得する。
   const url = new URL(req.url);
   const accountId = url.searchParams.get("account_id");
   const forceUidParam = url.searchParams.get("force_uid");
@@ -922,7 +887,6 @@ Deno.serve(async (req) => {
     return jsonResponse(req, { error: error.message }, 500);
   }
 
-  // アカウントを並列で同期。認証失敗しているアカウントが他の処理を待たせないように。
   const results: Record<string, unknown> = {};
   await Promise.all(
     ((accounts ?? []) as AccountRow[]).map(async (acc) => {

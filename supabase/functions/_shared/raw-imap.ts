@@ -107,7 +107,7 @@ export async function fetchSourceRawImap(opts: RawFetchOptions): Promise<Uint8Ar
     }
 
     // SELECT
-    await write(`a2 SELECT ${mailbox}\r\n`);
+    await write(`a2 SELECT "${mailbox}"\r\n`);
     const sel = await readUntilTagged("a2");
     if (!/^a2 OK/i.test(sel.final)) {
       throw new Error(`raw-imap select failed: ${sel.final.trim()}`);
@@ -210,7 +210,7 @@ export async function fetchSourcesRawImap(opts: BatchFetchOptions): Promise<Batc
 
     // SELECT
     const selTag = nextTag();
-    await write(`${selTag} SELECT ${mailbox}\r\n`);
+    await write(`${selTag} SELECT "${mailbox}"\r\n`);
     const sel = await readUntilTagged(selTag);
     if (!/^\S+\s+OK/i.test(sel.final)) {
       throw new Error(`raw-imap batch select failed: ${sel.final.trim()}`);
@@ -318,7 +318,7 @@ export async function markSeenRawImap(opts: MarkSeenOptions): Promise<{ marked: 
       throw new Error(`raw-imap auth failed: ${auth.final.trim()}`);
     }
     const selTag = nextTag();
-    await write(`${selTag} SELECT ${mailbox}\r\n`);
+    await write(`${selTag} SELECT "${mailbox}"\r\n`);
     const sel = await readUntilTagged(selTag);
     if (!/OK/i.test(sel.final.split(" ")[1] ?? "")) {
       throw new Error(`raw-imap select failed: ${sel.final.trim()}`);
@@ -438,7 +438,7 @@ export async function moveToTrashRawImap(opts: TrashOptions): Promise<TrashResul
 
     // SELECT INBOX (read-write)
     const selTag = nextTag();
-    await write(`${selTag} SELECT ${mailbox}\r\n`);
+    await write(`${selTag} SELECT "${mailbox}"\r\n`);
     const sel = await readUntilTagged(selTag);
     if (!/OK/i.test(sel.final.split(" ")[1] ?? "")) {
       throw new Error(`raw-imap select failed: ${sel.final.trim()}`);

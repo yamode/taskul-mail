@@ -1,6 +1,26 @@
 # HANDOFF.md — taskul-mail
 
-> **最終更新**: 2026-04-23（v0.16.1: folder discovery + 逆方向 \Seen 同期 / dev のみ）
+> **最終更新**: 2026-04-23（v0.17.0: Sent/Archive 本体同期 Step 3b / dev のみ）
+
+## v0.17.0 — Sent / Archive フォルダ本体同期（Step 3b / dev）
+
+`imap-sync` を INBOX 専用から多フォルダ巡回型にリファクタ。`mail.folders` テーブルで role ∈ (`inbox`, `sent`, `archive`) のフォルダを順に同期する。
+
+**変更点**
+- `syncOneFolder()` を分離。UIDVALIDITY / last_uid / highest_modseq をフォルダ単位で管理（従来は `accounts.last_uid` だけ）
+- Sent は `direction = 'outbound'` として `messages` に記録
+- CONDSTORE フラグ同期・EXPUNGE 検出もフォルダ単位で独立に動作
+- INBOX の同期完了時は `accounts.last_uid` / `last_uidvalidity` / `last_synced_at` も後方互換でミラー更新（IDLE worker 等の既存読み取りが壊れないように）
+- `force_uid` 再取得は INBOX のみ対象（UI 仕様維持）
+- raw IMAP の SELECT を `"${mailbox}"` で引用符囲みに変更（非 ASCII / スペース含むフォルダ名への備え）
+
+**必要なデプロイ**
+- `supabase functions deploy imap-sync`（migration は追加なし）
+
+**未実装 / 次**
+- Step 3c: UI フォルダナビ（アカウント展開で INBOX / Sent / Archive 切替、フォルダ単位の未読カウント）
+- Drafts / Trash / Junk の同期（現状は SYNCABLE_ROLES から除外）
+- 非 ASCII フォルダ名の Modified UTF-7 エンコード（現状は生文字で SELECT するため Courier 側で名前マッチしない可能性あり）
 
 ## v0.16.1 — folder discovery（Step 3b 前段）
 
@@ -78,17 +98,14 @@ taskul-mail で既読化したメッセージを IMAP サーバ側にも `\Seen`
 
 ## 残タスク（優先順）
 
-### 1. Sent/Archive フォルダ同期の本体実装（Step 3b/3c）
+### 1. Sent/Archive UI フォルダナビ（Step 3c）
 
-スキーマ基盤（`mail.folders` / `messages.folder_id`）は v0.12.0 で投入済み。残りは:
+Step 3b (v0.17.0) で imap-sync の多フォルダ同期は入った。残り:
 
-- **Step 3b**: `imap-sync` Edge Function を多フォルダループ対応
-  - 起動時に IMAP `LIST` で SPECIAL-USE を取得 → `mail.folders` に upsert（`\Sent` / `\Archive` / `\Trash` / `\Drafts` で role 判定）
-  - folder 単位で UIDVALIDITY + last_uid を管理（現在 `mail.folders` カラム使用）
-  - INBOX 以外も差分同期ループに組み込む
 - **Step 3c**: UI にフォルダナビ追加
   - アカウント展開時にフォルダ一覧表示（INBOX / Sent / Archive / Trash / ...）
   - クリックで切替、フォルダ単位の未読カウント
+  - Sent 側の表示は direction='outbound' のメッセージを to_addresses ベースで表示する想定
 
 ### 2. VPS IDLE worker の安定化確認（3 日並行運用）
 
