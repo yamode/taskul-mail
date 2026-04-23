@@ -22,3 +22,6 @@ verify_jwt = false
 
 [functions.imap-trash]
 verify_jwt = false
+
+[functions.imap-mark-seen]
+verify_jwt = false

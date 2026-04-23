@@ -94,6 +94,60 @@ async function syncOneAccount(
     throw e;
   }
 
+  // フォルダ discovery: IMAP LIST で SPECIAL-USE を取得し mail.folders へ upsert。
+  // INBOX 同期本体は後段の既存ロジックをそのまま使うため、ここは discovery のみ。
+  // Sent/Archive の本体同期 (Step 3c) は別途。
+  try {
+    const list = await client.list() as Array<{
+      path?: string;
+      name?: string;
+      specialUse?: string;
+      flags?: Set<string> | string[];
+    }>;
+    const rows: Array<{ account_id: string; name: string; role: string; special_use: string | null }> = [];
+    for (const entry of list ?? []) {
+      const path = entry.path ?? entry.name;
+      if (!path) continue;
+      const flagSet = entry.flags instanceof Set
+        ? entry.flags
+        : new Set((entry.flags as string[] | undefined) ?? []);
+      const special = entry.specialUse ?? (() => {
+        for (const f of flagSet) {
+          if (/^\\(Sent|Drafts|Trash|Junk|Archive|All|Flagged|Important)$/i.test(f)) return f;
+        }
+        return null;
+      })();
+      let role = "other";
+      if (path.toUpperCase() === "INBOX") role = "inbox";
+      else if (special) {
+        const s = special.toLowerCase();
+        if (s.includes("sent")) role = "sent";
+        else if (s.includes("drafts")) role = "drafts";
+        else if (s.includes("trash")) role = "trash";
+        else if (s.includes("junk")) role = "junk";
+        else if (s.includes("archive") || s.includes("all")) role = "archive";
+      } else {
+        // 名前推定フォールバック (Courier など SPECIAL-USE 未対応サーバ向け)
+        const lower = path.toLowerCase();
+        if (/(^|[./])sent($|[./])/.test(lower) || lower.endsWith("送信済み")) role = "sent";
+        else if (/(^|[./])drafts?($|[./])/.test(lower) || lower.endsWith("下書き")) role = "drafts";
+        else if (/(^|[./])trash($|[./])/.test(lower) || lower.includes("ゴミ箱") || lower.includes("deleted")) role = "trash";
+        else if (/(^|[./])(junk|spam)($|[./])/.test(lower)) role = "junk";
+        else if (/(^|[./])archive($|[./])/.test(lower) || lower.endsWith("アーカイブ")) role = "archive";
+      }
+      rows.push({ account_id: account.id, name: path, role, special_use: special ?? null });
+    }
+    if (rows.length > 0) {
+      const { error: fErr } = await sb
+        .from("folders")
+        .upsert(rows, { onConflict: "account_id,name", ignoreDuplicates: false });
+      if (fErr) console.warn(`[${account.email_address}] folders upsert failed: ${fErr.message}`);
+      else diag.folders_discovered = rows.length;
+    }
+  } catch (e) {
+    console.warn(`[${account.email_address}] LIST discovery failed: ${(e as Error).message}`);
+  }
+
   // INBOX フォルダ id (messages.folder_id を正しくセットするため必須。
   // migration 013 以降、unique index は (account_id, folder_id, imap_uid) の
   // 部分インデックスに変わっているので onConflict も合わせる必要がある)

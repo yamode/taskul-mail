@@ -271,6 +271,75 @@ export async function fetchSourcesRawImap(opts: BatchFetchOptions): Promise<Batc
   return { sources, errors };
 }
 
+export type MarkSeenOptions = {
+  host: string;
+  port: number;
+  user: string;
+  pass: string;
+  uids: number[];
+  mailbox?: string;
+  timeoutMs?: number;
+};
+
+/** 生 IMAP で UID 群に \Seen を付ける (UID STORE +FLAGS.SILENT)。 */
+export async function markSeenRawImap(opts: MarkSeenOptions): Promise<{ marked: number[] }> {
+  const mailbox = opts.mailbox ?? "INBOX";
+  const timeout = opts.timeoutMs ?? 30_000;
+  if (opts.uids.length === 0) return { marked: [] };
+
+  const conn = await Deno.connectTls({ hostname: opts.host, port: opts.port });
+  const reader = new IMAPReader(conn);
+  const enc = new TextEncoder();
+  const write = async (s: string) => { await conn.write(enc.encode(s)); };
+
+  let seq = 0;
+  const nextTag = () => `a${++seq}`;
+
+  const readUntilTagged = async (tag: string): Promise<{ final: string }> => {
+    while (true) {
+      const line = await reader.readLine();
+      if (line.startsWith(tag + " ")) return { final: line };
+      const m = line.match(/\{(\d+)\}\r?\n$/);
+      if (m) {
+        const size = parseInt(m[1], 10);
+        await reader.readBytes(size);
+        await reader.readLine();
+      }
+    }
+  };
+
+  const run = async (): Promise<{ marked: number[] }> => {
+    await reader.readLine(); // greeting
+    const payload = btoa(`\u0000${opts.user}\u0000${opts.pass}`);
+    const authTag = nextTag();
+    await write(`${authTag} AUTHENTICATE PLAIN ${payload}\r\n`);
+    const auth = await readUntilTagged(authTag);
+    if (!/OK/i.test(auth.final.split(" ")[1] ?? "")) {
+      throw new Error(`raw-imap auth failed: ${auth.final.trim()}`);
+    }
+    const selTag = nextTag();
+    await write(`${selTag} SELECT ${mailbox}\r\n`);
+    const sel = await readUntilTagged(selTag);
+    if (!/OK/i.test(sel.final.split(" ")[1] ?? "")) {
+      throw new Error(`raw-imap select failed: ${sel.final.trim()}`);
+    }
+    const stTag = nextTag();
+    await write(`${stTag} UID STORE ${opts.uids.join(",")} +FLAGS.SILENT (\\Seen)\r\n`);
+    const st = await readUntilTagged(stTag);
+    if (!/OK/i.test(st.final.split(" ")[1] ?? "")) {
+      throw new Error(`raw-imap UID STORE \\Seen failed: ${st.final.trim()}`);
+    }
+    try { await write(`${nextTag()} LOGOUT\r\n`); } catch { /* ignore */ }
+    return { marked: opts.uids };
+  };
+
+  try {
+    return await withTimeout(run(), timeout, `raw-imap mark-seen timeout`);
+  } finally {
+    try { conn.close(); } catch { /* ignore */ }
+  }
+}
+
 export type TrashOptions = {
   host: string;
   port: number;
