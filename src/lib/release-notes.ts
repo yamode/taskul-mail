@@ -6,6 +6,14 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.19.1",
+    date: "2026-04-23",
+    changes: [
+      "緊急: DB 過負荷で 504 多発 → ポーリング間隔を DB 15s → 120s / IMAP 60s → 180s に延長。新着は Realtime 購読で引き続き即時反映",
+      "messages テーブルに partial index を追加するマイグレーション (手動実行): loadThreads クエリを高速化",
+    ],
+  },
+  {
     version: "0.19.0",
     date: "2026-04-23",
     changes: [
