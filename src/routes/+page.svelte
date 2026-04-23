@@ -72,6 +72,10 @@
     userBody: string;    // ユーザが書く部分
     quotedBody: string;  // 引用本文 (divider 以降)
     showQuoted: boolean;
+    // AI 下書き由来の場合のみ: フィードバック用の原文と評価状態
+    aiOriginalBody?: string;
+    feedbackRating?: "good" | "bad" | null;
+    feedbackComment?: string;
   };
 
   let threads = $state<Thread[]>([]);
@@ -1399,6 +1403,9 @@
         userBody: json.body_text ?? "",
         quotedBody,
         showQuoted: false,
+        aiOriginalBody: json.body_text ?? "",
+        feedbackRating: null,
+        feedbackComment: "",
       };
     } catch (e) {
       alert(`下書き生成失敗: ${(e as Error).message}`);
@@ -1420,6 +1427,53 @@
       .eq("id", compose.id);
   }
 
+  // 👍 / 👎 ボタンを押した時: トグル (同じものを再クリックでクリア) し、即保存
+  async function setFeedbackRating(r: "good" | "bad") {
+    if (!compose) return;
+    compose.feedbackRating = compose.feedbackRating === r ? null : r;
+    await saveDraftFeedback({ wasSent: false });
+  }
+
+  // コメント欄 blur 時に保存 (rating も無ければ空扱い)
+  async function saveFeedbackCommentIfAny() {
+    if (!compose) return;
+    await saveDraftFeedback({ wasSent: false });
+  }
+
+  // AI 下書きに対するフィードバックを保存。
+  // - 送信時 (wasSent=true): ai_original_body と最終本文を突き合わせて記録
+  // - 手動 (👍/👎 クリック): rating / comment のみ更新 (upsert)
+  async function saveDraftFeedback(opts: {
+    wasSent: boolean;
+    finalBody?: string;
+  }) {
+    if (!compose || !userId) return;
+    if (!compose.aiOriginalBody) return; // AI 由来でない
+    const src = messages.find((m) => m.id === compose!.sourceMessageId);
+    const accountId = src?.account_id;
+    if (!accountId) return;
+    const recipient = (src?.from_address ?? "").toLowerCase() || null;
+    const rating = compose.feedbackRating ?? null;
+    const comment = (compose.feedbackComment ?? "").trim() || null;
+    // 何も情報がなければ何もしない (送信時は常に記録、手動時は rating か comment が必要)
+    if (!opts.wasSent && !rating && !comment) return;
+    const row: Record<string, unknown> = {
+      draft_id: compose.id,
+      account_id: accountId,
+      user_id: userId,
+      rating,
+      comment,
+      ai_original_body: compose.aiOriginalBody,
+      final_body: opts.finalBody ?? null,
+      was_sent: opts.wasSent,
+      recipient_address: recipient,
+    };
+    // 同じ draft_id に 1 行のみ持たせるために upsert 代わりに delete+insert
+    await mail.from("draft_feedback").delete().eq("draft_id", compose.id);
+    const { error } = await mail.from("draft_feedback").insert(row);
+    if (error) console.warn("draft_feedback insert failed", error);
+  }
+
   async function sendCompose() {
     if (!compose) return;
     if (compose.to.length === 0) { alert("宛先を入力してください"); return; }
@@ -1434,6 +1488,10 @@
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "failed");
+      // AI 下書きなら送信時の最終本文をフィードバックとして保存
+      if (compose.aiOriginalBody) {
+        await saveDraftFeedback({ wasSent: true, finalBody: compose.userBody });
+      }
       alert("送信しました");
       compose = null;
       if (selectedThreadId) {
@@ -1776,14 +1834,6 @@
             <span class="account-unread-dot" aria-hidden="true"></span>
           {/if}
         </button>
-        {#if !accountsCollapsed && (a.unread_count ?? 0) > 0}
-          <button
-            class="mark-all-read"
-            title="このアカウントの未読をすべて既読にする"
-            aria-label="すべて既読にする"
-            onclick={(e) => markAllReadForAccount(a.id, e)}
-          >✓✓</button>
-        {/if}
         {#if !accountsCollapsed && (foldersByAccount[a.id]?.length ?? 0) > 1}
           <button
             class="folder-toggle"
@@ -1886,6 +1936,16 @@
             onclick={openToneModal}
             title="このアカウントの AI トーン設定を編集"
           >✨ AI 設定</button>
+        </div>
+        <div class="inbox-header-row inbox-header-bulk">
+          <button
+            class="ih-btn bulk-read"
+            disabled={(currentAccount.unread_count ?? 0) === 0}
+            onclick={(e) => markAllReadForAccount(currentAccount!.id, e)}
+            title="このアカウントの未読をすべて既読にする"
+          >
+            ✓✓ 一括既読{#if (currentAccount.unread_count ?? 0) > 0} ({currentAccount.unread_count}){/if}
+          </button>
         </div>
       </header>
     {/if}
@@ -2140,6 +2200,30 @@
                   />
                 </label>
               </div>
+              {#if compose.aiOriginalBody}
+                <div class="compose-header-row fb-row" title="この評価は次回以降の Claude 生成に反映されます">
+                  <span class="fb-label">この下書きはどう？</span>
+                  <button
+                    class="fb-btn"
+                    class:selected={compose.feedbackRating === "good"}
+                    onclick={() => void setFeedbackRating("good")}
+                    title="良い (👍)"
+                  >👍</button>
+                  <button
+                    class="fb-btn"
+                    class:selected={compose.feedbackRating === "bad"}
+                    onclick={() => void setFeedbackRating("bad")}
+                    title="悪い (👎)"
+                  >👎</button>
+                  <input
+                    type="text"
+                    class="fb-comment"
+                    placeholder="改善点をひとこと (例: もう少しフランクに / 署名入れないで)"
+                    bind:value={compose.feedbackComment}
+                    onblur={() => void saveFeedbackCommentIfAny()}
+                  />
+                </div>
+              {/if}
             {/if}
           </header>
         {:else}
@@ -2535,29 +2619,6 @@
     color: #374151;
     min-width: 0;
   }
-  .mark-all-read {
-    position: absolute;
-    right: 4px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 24px;
-    height: 22px;
-    border-radius: 4px;
-    border: 1px solid #d1d5db;
-    background: #fff;
-    color: #059669;
-    font-size: 0.72rem;
-    font-weight: 700;
-    cursor: pointer;
-    padding: 0;
-    display: none;
-    align-items: center;
-    justify-content: center;
-    line-height: 1;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.06);
-  }
-  .account-wrap:hover .mark-all-read { display: inline-flex; }
-  .mark-all-read:hover { background: #ecfdf5; border-color: #6ee7b7; }
   .account:hover { background: #e5e7eb; }
   .account.selected {
     background: #fff;
@@ -2709,6 +2770,17 @@
     white-space: nowrap;
   }
   .inbox-header-actions { gap: 0.5rem; }
+  .inbox-header-bulk { gap: 0.5rem; }
+  .ih-btn.bulk-read {
+    flex: 1;
+    font-size: 0.82rem;
+    padding: 0.4rem 0.6rem;
+    color: #059669;
+    border-color: #d1fae5;
+    background: #f0fdf4;
+  }
+  .ih-btn.bulk-read:hover:not(:disabled) { background: #dcfce7; border-color: #6ee7b7; }
+  .ih-btn.bulk-read:disabled { opacity: 0.4; cursor: not-allowed; }
   .ih-btn {
     flex: 1;
     font-size: 0.92rem;
@@ -3094,6 +3166,45 @@
     font-family: inherit;
   }
   .tone-hint > input:focus { outline: 2px solid #bfdbfe; border-color: #60a5fa; }
+
+  .fb-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-top: 0.4rem;
+    border-top: 1px dashed #e5e7eb;
+    flex-wrap: wrap;
+  }
+  .fb-label {
+    font-size: 0.72rem;
+    color: #6b7280;
+    white-space: nowrap;
+  }
+  .fb-btn {
+    border: 1px solid #e5e7eb;
+    background: #fff;
+    border-radius: 4px;
+    padding: 0.15rem 0.5rem;
+    cursor: pointer;
+    font-size: 0.95rem;
+    line-height: 1;
+  }
+  .fb-btn:hover { background: #f9fafb; }
+  .fb-btn.selected {
+    background: #fef3c7;
+    border-color: #f59e0b;
+  }
+  .fb-comment {
+    flex: 1;
+    min-width: 140px;
+    border: 1px solid #e5e7eb;
+    background: #fff;
+    border-radius: 4px;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.82rem;
+    font-family: inherit;
+  }
+  .fb-comment:focus { outline: 2px solid #bfdbfe; border-color: #60a5fa; }
 
   .compose {
     padding: 1rem 1.25rem 2rem;
