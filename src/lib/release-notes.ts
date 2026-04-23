@@ -6,6 +6,15 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.19.2",
+    date: "2026-04-23",
+    changes: [
+      "緊急 v2: DB ポーリング完全停止 (Realtime + 手動更新のみ)。IMAP sync は 5 分に 1 回",
+      "Realtime 連鎖で loadThreads が秒間何度も走る問題を 1.5s debounce で抑制",
+      "重量メッセージクエリに LIMIT 1000 を付与してタイムアウト耐性を確保",
+    ],
+  },
+  {
     version: "0.19.1",
     date: "2026-04-23",
     changes: [

@@ -256,8 +256,9 @@
   //   (a) Supabase Realtime で mail.messages INSERT を購読し、即座に反映
   //   (b) 15 秒ごとに threads テーブルだけを軽量 poll するフォールバック
   //   (c) 60 秒ごとに IMAP sync を実行 (重いので頻度は維持)
-  const IMAP_SYNC_INTERVAL = 180_000;   // 60s → 180s (DB 過負荷緩和)
-  const DB_POLL_INTERVAL = 120_000;     // 15s → 120s (Realtime 購読で新着は即反映されるのでフォールバック)
+  const IMAP_SYNC_INTERVAL = 300_000;   // 5 分 (IDLE worker + Cron が本線)
+  // 定期ポーリング廃止。Realtime 購読 + visibility/手動更新で代替。
+  const DB_POLL_INTERVAL: number | null = null;
   const IMAP_SYNC_TIMEOUT = 45_000;
 
   function setAcctSync(id: string, patch: Partial<AcctSync>) {
@@ -333,8 +334,10 @@
 
     // IMAP 同期は 60 秒に 1 回 (重いので頻度据え置き)
     syncTimer = setInterval(syncTick, IMAP_SYNC_INTERVAL);
-    // DB poll は 15 秒に 1 回 (軽量・gmail ライク)
-    pollTimer = setInterval(lightPoll, DB_POLL_INTERVAL);
+    // DB poll は廃止。Realtime 購読 + visibility / 手動更新で代替
+    if (DB_POLL_INTERVAL) {
+      pollTimer = setInterval(lightPoll, DB_POLL_INTERVAL);
+    }
     // 相対時刻表示の更新 (30 秒に 1 回)
     clockTimer = setInterval(() => (nowTick = Date.now()), 30_000);
 
@@ -349,7 +352,7 @@
           "postgres_changes",
           { event: "INSERT", schema: "mail", table: "messages" },
           (payload: any) => {
-            void loadThreads();
+            loadThreadsDebounced();
             if (selectedThreadId && payload?.new?.thread_id === selectedThreadId) {
               void loadMessages(selectedThreadId);
             }
@@ -372,7 +375,7 @@
           "postgres_changes",
           { event: "*", schema: "mail", table: "message_reads" },
           () => {
-            void loadThreads();
+            loadThreadsDebounced();
           },
         )
         .on(
@@ -394,7 +397,7 @@
           "postgres_changes",
           { event: "UPDATE", schema: "mail", table: "threads" },
           () => {
-            void loadThreads();
+            loadThreadsDebounced();
           },
         )
         .subscribe();
@@ -735,6 +738,22 @@
   let knownThreadIds = new Set<string>();
   let newThreadIds = $state<Set<string>>(new Set());
 
+  // Realtime 連鎖で loadThreads が秒間何度も呼ばれて DB を詰まらせるのを防ぐ debounce。
+  // INSERT / UPDATE が立て続けに来ても 1500ms に 1 度しか実際には走らせない。
+  let loadThreadsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let loadThreadsInFlight = false;
+  function loadThreadsDebounced() {
+    if (loadThreadsDebounceTimer) clearTimeout(loadThreadsDebounceTimer);
+    loadThreadsDebounceTimer = setTimeout(() => {
+      loadThreadsDebounceTimer = null;
+      if (loadThreadsInFlight) return;
+      loadThreadsInFlight = true;
+      loadThreads()
+        .catch((e) => console.warn("loadThreads failed", e))
+        .finally(() => { loadThreadsInFlight = false; });
+    }, 1500);
+  }
+
   async function loadThreads() {
     // trashed_at is null のみ表示 (migration 未適用環境では全件取れる)
     const { data, error } = await mail
@@ -814,12 +833,15 @@
     // スレッド別コメント件数 (バッジ表示用) + 最新メッセージの送信者
     if (base.length > 0) {
       const threadIds = base.map((t) => t.id);
+      // LIMIT で結果行数を上限化。100 スレッド × 平均 5 件で 500 想定。
+      // 取りこぼした古いメッセージはコメント件数バッジがズレる程度で、次回 loadThreads で自然に埋まる
       const { data: threadMsgs } = await mail
         .from("messages")
         .select("id,thread_id,folder_id,from_name,from_address,received_at,has_attachments")
         .in("thread_id", threadIds)
         .is("server_deleted_at", null)
-        .order("received_at", { ascending: false });
+        .order("received_at", { ascending: false })
+        .limit(1000);
       const msgToThread = new Map<string, string>();
       const latestByThread = new Map<string, { from_name: string | null; from_address: string | null }>();
       const hasAttByThread = new Set<string>();
