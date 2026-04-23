@@ -138,6 +138,72 @@ Deno.serve(async (req) => {
     const toneBlocks: string[] = [];
     if (baseTone) toneBlocks.push(`【アカウント基本トーン】\n${baseTone}`);
     if (extraHint) toneBlocks.push(`【今回の追加指示】\n${extraHint}`);
+
+    // 過去のフィードバックを注入:
+    // - 同じ送信相手 (from_address) からの評価を優先、無ければアカウント全体
+    // - 👎 のみ / 👍 は参考程度
+    // - 送信時の編集差分があれば「AI 生成 → 最終」として抜粋
+    type FbRow = {
+      rating: string | null;
+      comment: string | null;
+      ai_original_body: string | null;
+      final_body: string | null;
+      was_sent: boolean;
+      recipient_address: string | null;
+      created_at: string;
+    };
+    const fbFields =
+      "rating,comment,ai_original_body,final_body,was_sent,recipient_address,created_at";
+    const recipient = (target.from_address ?? "").toLowerCase();
+    const fbs: FbRow[] = [];
+    if (recipient) {
+      const { data } = await sb
+        .from("draft_feedback")
+        .select(fbFields)
+        .eq("account_id", target.account_id)
+        .eq("recipient_address", recipient)
+        .order("created_at", { ascending: false })
+        .limit(3);
+      fbs.push(...((data ?? []) as FbRow[]));
+    }
+    if (fbs.length < 5) {
+      const { data } = await sb
+        .from("draft_feedback")
+        .select(fbFields)
+        .eq("account_id", target.account_id)
+        .order("created_at", { ascending: false })
+        .limit(5 - fbs.length);
+      const seen = new Set(fbs.map((f) => f.created_at));
+      for (const row of (data ?? []) as FbRow[]) {
+        if (!seen.has(row.created_at)) fbs.push(row);
+      }
+    }
+    const fbLines: string[] = [];
+    for (const f of fbs) {
+      const parts: string[] = [];
+      if (f.rating === "bad") parts.push("👎 (悪い)");
+      else if (f.rating === "good") parts.push("👍 (良い)");
+      if (f.comment) parts.push(`コメント: ${f.comment}`);
+      if (
+        f.was_sent &&
+        f.ai_original_body &&
+        f.final_body &&
+        f.ai_original_body.trim() !== f.final_body.trim()
+      ) {
+        parts.push(
+          `AI 生成:\n${f.ai_original_body.slice(0, 600)}\n→ 実際の送信:\n${f.final_body.slice(0, 600)}`,
+        );
+      }
+      if (parts.length > 0) fbLines.push(parts.join("\n"));
+    }
+    if (fbLines.length > 0) {
+      toneBlocks.push(
+        `【過去のフィードバック (新しい順・最大 5 件)】\n` +
+          `以下を参考にトーンや言い回しを調整してください。特に 👎 や「AI 生成 → 実際の送信」の差分から学んでください。\n\n` +
+          fbLines.map((l, i) => `(${i + 1}) ${l}`).join("\n\n"),
+      );
+    }
+
     const toneSection = toneBlocks.length > 0 ? `\n${toneBlocks.join("\n\n")}\n` : "";
 
     const userPrompt = [
@@ -189,6 +255,7 @@ Deno.serve(async (req) => {
         cc_addresses: [],
         subject: parsed.subject,
         body_text: parsed.body_text,
+        ai_original_body: parsed.body_text,
         generated_by_ai: true,
         ai_prompt_hint: recordedHint,
         status: "draft",
