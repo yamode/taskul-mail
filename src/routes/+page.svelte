@@ -82,6 +82,8 @@
   let filterAccountId = $state<string>("");
   // フォルダフィルタ (アカウント単位で状態を保持)。"" は「すべて」= アカウント内全フォルダ。
   let filterFolderId = $state<string>("");
+  // アコーディオン: ▼ を押されたアカウントだけフォルダナビを展開する
+  let expandedAccounts = $state<Record<string, boolean>>({});
   // 詳細ペインの表示モード: 受信トレイ / 下書き一覧
   let view = $state<"inbox" | "drafts">("inbox");
   let selectedThreadId = $state<string | null>(null);
@@ -1782,15 +1784,25 @@
             onclick={(e) => markAllReadForAccount(a.id, e)}
           >✓✓</button>
         {/if}
-        {#if !accountsCollapsed && filterAccountId === a.id && (foldersByAccount[a.id]?.length ?? 0) > 1}
+        {#if !accountsCollapsed && (foldersByAccount[a.id]?.length ?? 0) > 1}
+          <button
+            class="folder-toggle"
+            class:open={!!expandedAccounts[a.id]}
+            title={expandedAccounts[a.id] ? "フォルダを閉じる" : "フォルダを開く"}
+            aria-label="フォルダ展開"
+            aria-expanded={!!expandedAccounts[a.id]}
+            onclick={(e) => { e.stopPropagation(); expandedAccounts = { ...expandedAccounts, [a.id]: !expandedAccounts[a.id] }; }}
+          >▾</button>
+        {/if}
+        {#if !accountsCollapsed && expandedAccounts[a.id] && (foldersByAccount[a.id]?.length ?? 0) > 1}
           <div class="folder-nav" role="tablist" aria-label="フォルダ">
             {#each foldersByAccount[a.id] as f (f.id)}
               <button
                 class="folder-item"
-                class:selected={filterFolderId === f.id}
+                class:selected={filterAccountId === a.id && filterFolderId === f.id}
                 role="tab"
-                aria-selected={filterFolderId === f.id}
-                onclick={() => selectFolder(f.id)}
+                aria-selected={filterAccountId === a.id && filterFolderId === f.id}
+                onclick={() => { if (filterAccountId !== a.id) selectAccount(a.id); selectFolder(f.id); }}
                 title={f.name}
               >
                 <span class="folder-icon">{f.role === "sent" ? "📤" : f.role === "archive" ? "🗂" : "📥"}</span>
@@ -2506,6 +2518,7 @@
     position: relative;
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
   }
   .account {
     flex: 1;
@@ -2567,24 +2580,46 @@
   }
   .acct-err:hover { color: #92400e; }
 
-  /* フォルダナビ (Step 3c) */
+  /* フォルダナビ (Step 3c — アコーディオン) */
+  .folder-toggle {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border: none;
+    background: transparent;
+    color: #6b7280;
+    font-size: 0.75rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+    margin-left: 2px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.15s ease;
+  }
+  .folder-toggle:hover { background: #e5e7eb; color: #111; }
+  .folder-toggle.open { transform: rotate(180deg); }
   .folder-nav {
+    flex-basis: 100%;
+    width: 100%;
     display: flex;
     flex-direction: column;
-    gap: 0.15rem;
-    margin: 0.2rem 0 0.3rem 1.4rem;
-    padding-left: 0.4rem;
-    border-left: 2px solid #e5e7eb;
+    gap: 0.1rem;
+    margin: 0.15rem 0 0.25rem 1.8rem;
+    padding-left: 0.5rem;
+    border-left: 2px solid #d1d5db;
   }
   .folder-item {
     display: flex;
     align-items: center;
-    gap: 0.35rem;
+    gap: 0.4rem;
     padding: 0.3rem 0.5rem;
     background: transparent;
     border: 1px solid transparent;
     border-radius: 4px;
-    font-size: 0.78rem;
+    font-size: 0.82rem;
     color: #4b5563;
     cursor: pointer;
     text-align: left;
@@ -2596,13 +2631,14 @@
     color: #111;
     font-weight: 600;
   }
-  .folder-icon { font-size: 0.85rem; }
+  .folder-icon { font-size: 0.9rem; }
   .folder-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .folder-unread {
     background: #ef4444; color: #fff; font-size: 0.65rem; font-weight: 700;
     padding: 0.05rem 0.35rem; border-radius: 8px; min-width: 1.2rem; text-align: center;
   }
-  .accounts.collapsed .folder-nav { display: none; }
+  .accounts.collapsed .folder-nav,
+  .accounts.collapsed .folder-toggle { display: none; }
   .accounts-footer { margin-top: auto; padding-top: 0.5rem; }
   .accounts-footer .reload {
     width: 100%;
