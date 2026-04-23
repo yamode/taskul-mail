@@ -1,6 +1,23 @@
 # HANDOFF.md — taskul-mail
 
-> **最終更新**: 2026-04-23（v0.15.0: CONDSTORE による既読・削除の双方向同期 / dev→main merge 済 / migration 20260423000002 要適用）
+> **最終更新**: 2026-04-23（v0.16.0: 逆方向 \Seen 同期 / dev のみ / main merge・deploy は次回）
+
+## v0.16.0 — 逆方向 \Seen 同期（dev）
+
+taskul-mail で既読化したメッセージを IMAP サーバ側にも `\Seen` として反映。
+
+- 新 Edge Function `imap-mark-seen`（`verify_jwt=false`）: `{ message_ids: string[] }` を受けて UID STORE +FLAGS (\Seen) を実行
+- `_shared/raw-imap.ts` に `markSeenRawImap` 追加（AUTH → SELECT → UID STORE のシンプル系）
+- フロントの `markRead()` から fire-and-forget で呼び出し。**個人アカウントのみ**対象（共有は per-user 既読を保つためスキップ）
+- CONDSTORE（v0.15.0）と合わせて双方向の既読同期が成立
+
+**必要なデプロイ**
+- `supabase functions deploy imap-mark-seen`
+- （config.toml に verify_jwt=false 追加済み）
+
+**未実装（次）**
+- 共有アカウントの \Seen をどう扱うかのプロダクト判断（現状は意図的にスキップ）
+- Sent/Archive 多フォルダ同期（Step 3b/3c）
 
 ## v0.15.0 — CONDSTORE 同期（dev）
 

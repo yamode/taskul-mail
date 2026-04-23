@@ -1374,6 +1374,15 @@
       );
     const msg = messages.find((m) => m.id === messageId);
     const accountId = msg?.account_id;
+    // 個人アカウントのみ IMAP サーバ側にも \Seen を反映 (共有は per-user 既読を保つためスキップ)。
+    const acc = accounts.find((a) => a.id === accountId);
+    if (acc && !acc.is_shared) {
+      fetch(fnUrl("imap-mark-seen"), {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(await authHeader()) },
+        body: JSON.stringify({ message_ids: [messageId] }),
+      }).catch((e) => console.warn("imap-mark-seen failed", e));
+    }
     if (selectedThreadId) {
       threads = threads.map((t) =>
         t.id === selectedThreadId && (t.unread_count ?? 0) > 0
