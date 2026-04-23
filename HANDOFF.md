@@ -1,6 +1,19 @@
 # HANDOFF.md — taskul-mail
 
-> **最終更新**: 2026-04-23（v0.16.0: 逆方向 \Seen 同期 / dev のみ / main merge・deploy は次回）
+> **最終更新**: 2026-04-23（v0.16.1: folder discovery + 逆方向 \Seen 同期 / dev のみ）
+
+## v0.16.1 — folder discovery（Step 3b 前段）
+
+`imap-sync` 実行時に IMAP LIST を叩いて SPECIAL-USE / 名前推定で `mail.folders` を自動 upsert する。
+INBOX 同期本体のロジックは一切変更していないのでリグレッションなし。
+Sent/Archive の本体同期・UI フォルダナビは次のステップ (3c)。
+
+**role 判定**
+- SPECIAL-USE フラグ優先 (`\Sent` / `\Drafts` / `\Trash` / `\Junk` / `\Archive` / `\All`)
+- フォールバック: 名前推定 (`Sent` / `送信済み` / `Drafts` / `下書き` / `Trash` / `ゴミ箱` / `Archive` / `アーカイブ` / `Junk` / `Spam`)
+
+**必要なデプロイ**
+- `supabase functions deploy imap-sync`
 
 ## v0.16.0 — 逆方向 \Seen 同期（dev）
 
