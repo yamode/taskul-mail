@@ -690,7 +690,7 @@
   }
 
   async function applyThreads(rows: any[]) {
-    const base: Thread[] = rows.map((t: any) => ({
+    let base: Thread[] = rows.map((t: any) => ({
       ...t,
       account_label: t.accounts?.label,
     }));
@@ -698,12 +698,15 @@
     const perAccount = new Map<string, number>();
     if (base.length > 0 && userId) {
       const threadIds = base.map((t) => t.id);
+      // server_deleted_at IS NOT NULL のメッセージは「他クライアントで削除済み」なので除外
+      // server_seen = true は「他クライアントで既読」なので既読扱い
       const [{ data: inbound }, { data: reads }] = await Promise.all([
         mail
           .from("messages")
-          .select("id,thread_id,account_id")
+          .select("id,thread_id,account_id,server_seen,server_deleted_at")
           .in("thread_id", threadIds)
-          .eq("direction", "inbound"),
+          .eq("direction", "inbound")
+          .is("server_deleted_at", null),
         mail
           .from("message_reads")
           .select("message_id")
@@ -712,7 +715,8 @@
       const readSet = new Set((reads ?? []).map((r: any) => r.message_id));
       const counts = new Map<string, number>();
       for (const m of (inbound ?? []) as any[]) {
-        if (!readSet.has(m.id)) {
+        const isRead = readSet.has(m.id) || m.server_seen === true;
+        if (!isRead) {
           counts.set(m.thread_id, (counts.get(m.thread_id) ?? 0) + 1);
           perAccount.set(m.account_id, (perAccount.get(m.account_id) ?? 0) + 1);
         }
@@ -732,6 +736,7 @@
         .from("messages")
         .select("id,thread_id,from_name,from_address,received_at,has_attachments")
         .in("thread_id", threadIds)
+        .is("server_deleted_at", null)
         .order("received_at", { ascending: false });
       const msgToThread = new Map<string, string>();
       const latestByThread = new Map<string, { from_name: string | null; from_address: string | null }>();
@@ -742,6 +747,12 @@
           latestByThread.set(m.thread_id, { from_name: m.from_name, from_address: m.from_address });
         }
         if (m.has_attachments) hasAttByThread.add(m.thread_id);
+      }
+      // live メッセージが 1 件も無いスレッド (全て server_deleted_at) はリストから除外
+      const liveThreadIds = new Set(latestByThread.keys());
+      const filtered = base.filter((t) => liveThreadIds.has(t.id));
+      if (filtered.length !== base.length) {
+        base = filtered;
       }
       for (const t of base) {
         const l = latestByThread.get(t.id);
@@ -788,6 +799,7 @@
         "id,account_id,thread_id,from_address,from_name,to_addresses,cc_addresses,subject,body_text,body_html,imap_uid,received_at,direction",
       )
       .eq("thread_id", threadId)
+      .is("server_deleted_at", null)
       .order("received_at", { ascending: true });
     const msgs = (data ?? []) as Message[];
     if (msgs.length > 0) {

@@ -1,6 +1,28 @@
 # HANDOFF.md — taskul-mail
 
-> **最終更新**: 2026-04-23（v0.14.0 リリース: 検索バー・添付アイコン・本文空フォールバック・IMAP 削除同期 / dev→main force-push / カスタムドメイン準備）
+> **最終更新**: 2026-04-23（v0.15.0 dev: CONDSTORE による既読・削除の双方向同期 / migration 20260423000002 要適用）
+
+## v0.15.0 — CONDSTORE 同期（dev）
+
+他 IMAP クライアントで既読化・削除したメールが taskul-mail に反映されない問題を修正。
+
+**仕組み**
+- `imap-sync` の末尾に reconcile フェーズを追加
+  1. **CONDSTORE フラグ同期**: `FETCH 1:* (UID FLAGS) (CHANGEDSINCE <前回MODSEQ>)` で前回以降にフラグが変わった UID だけ取得 → `messages.server_seen` を更新
+  2. **削除検出**: `SEARCH ALL` で取得した現存 UID 集合と DB の UID を突合 → DB にあって server に無いものを `server_deleted_at = now()` でマーク
+  3. `mail.folders.highest_modseq` に新しい MODSEQ を保存（次回の CHANGEDSINCE 起点）
+- UI は `server_deleted_at IS NOT NULL` を一覧・スレッドから除外。未読判定は `server_seen = true` も既読扱い
+- 逆方向（taskul-mail で既読 → サーバの \Seen セット）は未実装。必要なら imap-sync / imap-trash に STORE を追加
+
+**必要な migration（本番適用前に SQL Editor で実行）**
+- `supabase/migrations/20260423000002_imap_sync_state.sql`
+
+**未実装 / 今後**
+- 非 CONDSTORE サーバでの fallback（Xserver Courier は対応想定）
+- QRESYNC `VANISHED` 活用（現状は UID diff で代用）
+- 双方向 \Seen 同期（taskul-mail 側で既読化時にサーバへ STORE）
+- IDLE worker での FETCH レスポンス（フラグ変更）ハンドル
+
 
 ## 現在地サマリ
 

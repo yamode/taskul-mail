@@ -99,12 +99,14 @@ async function syncOneAccount(
   // 部分インデックスに変わっているので onConflict も合わせる必要がある)
   const { data: inboxFolder } = await sb
     .from("folders")
-    .select("id")
+    .select("id,highest_modseq")
     .eq("account_id", account.id)
     .eq("role", "inbox")
     .maybeSingle();
   const inboxFolderId = (inboxFolder as { id?: string } | null)?.id ?? null;
+  const storedHighestModseq = (inboxFolder as { highest_modseq?: number | string | null } | null)?.highest_modseq ?? null;
   diag.inbox_folder_id = inboxFolderId;
+  diag.stored_highest_modseq = storedHighestModseq;
 
   const lock = await client.getMailboxLock("INBOX");
 
@@ -666,6 +668,127 @@ async function syncOneAccount(
     // のバグの直接の原因だった。現在は envelope 失敗 UID は placeholder メッセージを
     // 挿入して通常フローで processed に含めるので、last_uid は placeholder upsert 経由で
     // 自然に前進する (skippedUids は診断ログ用)。
+
+    // ------------------------------------------------------------
+    // Reconcile phase: 既存メッセージのフラグ同期 + EXPUNGE 検出
+    // ------------------------------------------------------------
+    // 1) CONDSTORE フラグ同期 (RFC 7162):
+    //    前回の HIGHESTMODSEQ 以降にフラグが変わった UID だけを取得し、
+    //    server_seen を更新する。これにより他 IMAP クライアントで既読化された
+    //    メールが taskul-mail でも既読として見えるようになる。
+    // 2) 削除検出:
+    //    server 側の全 UID (allUidsCached) と DB にある UID を突合し、
+    //    DB にあって server に無い UID を server_deleted_at = now() でマーク。
+    //    (DB にあるのに server に無い = 他クライアントで削除/移動された)
+    //    DB にあるがまだ同期していない古い UID は backfill で拾うため、
+    //    「サーバ側に存在する UID 集合」を基準にした差分検出は安全。
+    // ------------------------------------------------------------
+    const serverHighestModseq = Number((mailbox as { highestModseq?: number | string | bigint }).highestModseq ?? 0) || null;
+    diag.server_highest_modseq = serverHighestModseq;
+    let flagReconcileCount = 0;
+    let deletionReconcileCount = 0;
+
+    // 1) CONDSTORE フラグ同期
+    if (serverHighestModseq && storedHighestModseq && Number(storedHighestModseq) < serverHighestModseq && inboxFolderId) {
+      try {
+        const changed: Array<{ uid: number; seen: boolean }> = [];
+        for await (const m of client.fetch(
+          "1:*",
+          { uid: true, flags: true },
+          { uid: true, changedSince: BigInt(storedHighestModseq as number) },
+        )) {
+          const uid = Number((m as { uid?: number | bigint }).uid ?? 0);
+          if (!uid) continue;
+          const flags = (m as { flags?: Set<string> | string[] }).flags;
+          const flagArr: string[] = flags
+            ? (flags instanceof Set ? Array.from(flags) : Array.from(flags as string[]))
+            : [];
+          const seen = flagArr.some((f) => String(f).toLowerCase() === "\\seen");
+          changed.push({ uid, seen });
+        }
+        diag.changedsince_count = changed.length;
+        if (changed.length > 0) {
+          // バッチ更新: 同じ seen 値ごとにまとめて IN (...) で流す
+          const seenUids = changed.filter((c) => c.seen).map((c) => c.uid);
+          const unseenUids = changed.filter((c) => !c.seen).map((c) => c.uid);
+          if (seenUids.length > 0) {
+            const { error: uErr } = await sb
+              .from("messages")
+              .update({ server_seen: true })
+              .eq("account_id", account.id)
+              .eq("folder_id", inboxFolderId)
+              .in("imap_uid", seenUids);
+            if (uErr) console.warn(`[${account.email_address}] server_seen update failed: ${uErr.message}`);
+            else flagReconcileCount += seenUids.length;
+          }
+          if (unseenUids.length > 0) {
+            const { error: uErr } = await sb
+              .from("messages")
+              .update({ server_seen: false })
+              .eq("account_id", account.id)
+              .eq("folder_id", inboxFolderId)
+              .in("imap_uid", unseenUids);
+            if (uErr) console.warn(`[${account.email_address}] server_seen unset failed: ${uErr.message}`);
+            else flagReconcileCount += unseenUids.length;
+          }
+        }
+      } catch (e) {
+        console.warn(`[${account.email_address}] CONDSTORE reconcile failed: ${(e as Error).message}`);
+        diag.condstore_error = (e as Error).message;
+      }
+    } else if (!serverHighestModseq) {
+      diag.condstore_supported = false;
+    }
+
+    // 2) 削除検出 (DB にあって server に無い UID)
+    if (inboxFolderId) {
+      try {
+        const serverUidSet = new Set(allUidsCached);
+        // DB の現存 UID を取得 (削除マーク済みは除外)
+        const { data: dbUidRows } = await sb
+          .from("messages")
+          .select("imap_uid")
+          .eq("account_id", account.id)
+          .eq("folder_id", inboxFolderId)
+          .is("server_deleted_at", null);
+        const dbUids = (dbUidRows ?? [])
+          .map((r) => Number((r as { imap_uid?: number }).imap_uid))
+          .filter((n) => Number.isFinite(n) && n > 0);
+        // EXISTS=0 (フォルダ空) は誤検知の危険があるのでスキップ
+        if (exists > 0) {
+          const missing = dbUids.filter((u) => !serverUidSet.has(u));
+          if (missing.length > 0) {
+            // 一気に全部消すと誤動作時のダメージが大きいので 1 回 200 件までに制限
+            const batch = missing.slice(0, 200);
+            const { error: dErr } = await sb
+              .from("messages")
+              .update({ server_deleted_at: new Date().toISOString() })
+              .eq("account_id", account.id)
+              .eq("folder_id", inboxFolderId)
+              .in("imap_uid", batch);
+            if (dErr) console.warn(`[${account.email_address}] server_deleted_at mark failed: ${dErr.message}`);
+            else deletionReconcileCount = batch.length;
+          }
+        }
+      } catch (e) {
+        console.warn(`[${account.email_address}] deletion reconcile failed: ${(e as Error).message}`);
+        diag.deletion_error = (e as Error).message;
+      }
+    }
+
+    // 3) HIGHESTMODSEQ を folders に保存 (次回の CHANGEDSINCE 起点)
+    if (serverHighestModseq && inboxFolderId) {
+      await sb
+        .from("folders")
+        .update({ highest_modseq: serverHighestModseq, last_synced_at: new Date().toISOString() })
+        .eq("id", inboxFolderId);
+    }
+
+    diag.flag_reconcile_count = flagReconcileCount;
+    diag.deletion_reconcile_count = deletionReconcileCount;
+    console.log(
+      `[${account.email_address}] RECONCILE flags=${flagReconcileCount} deletions=${deletionReconcileCount} modseq=${serverHighestModseq}`,
+    );
 
     // 触ったスレッドの message_count と last_message_at をまとめて更新
     for (const [tid, lastAt] of touchedThreads) {
