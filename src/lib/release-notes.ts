@@ -6,6 +6,30 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.17.0",
+    date: "2026-04-23",
+    changes: [
+      "Sent / Archive フォルダの本体同期 (Step 3b): imap-sync が INBOX だけでなく Sent/Archive も巡回し、フォルダごとに UIDVALIDITY / last_uid / highest_modseq を独立管理するように",
+      "Sent メールは direction='outbound' として messages に記録。CONDSTORE フラグ同期・削除検出もフォルダ単位で動作",
+      "raw IMAP の SELECT はフォルダ名を引用符で囲むように (Japanese / スペース含む名前への備え)",
+    ],
+  },
+  {
+    version: "0.16.1",
+    date: "2026-04-23",
+    changes: [
+      "imap-sync 実行時に IMAP LIST でフォルダ一覧を取得し、SPECIAL-USE / 名前推定で mail.folders を自動 upsert (Step 3b 前段)",
+    ],
+  },
+  {
+    version: "0.16.0",
+    date: "2026-04-23",
+    changes: [
+      "taskul-mail で既読化したメールを IMAP サーバにも \\Seen として反映 (逆方向同期): 新 Edge Function imap-mark-seen が UID STORE を実行",
+      "共有アカウントは per-user 既読を保つため対象外 (個人アカウントのみ)",
+    ],
+  },
+  {
     version: "0.15.0",
     date: "2026-04-23",
     changes: [
