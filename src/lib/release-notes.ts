@@ -6,6 +6,13 @@ export interface ReleaseNote {
 
 export const releaseNotes: ReleaseNote[] = [
   {
+    version: "0.18.1",
+    date: "2026-04-23",
+    changes: [
+      "フォルダナビをアコーディオン化: 各アカウント右側の ▾ ボタンで開閉。デフォルトは閉。受信トレイを選択した状態がアカウントクリックの既定動作",
+    ],
+  },
+  {
     version: "0.18.0",
     date: "2026-04-23",
     changes: [
