@@ -1,6 +1,6 @@
 # HANDOFF.md — taskul-mail
 
-> **最終更新**: 2026-04-23（v0.15.0 dev: CONDSTORE による既読・削除の双方向同期 / migration 20260423000002 要適用）
+> **最終更新**: 2026-04-23（v0.15.0: CONDSTORE による既読・削除の双方向同期 / dev→main merge 済 / migration 20260423000002 要適用）
 
 ## v0.15.0 — CONDSTORE 同期（dev）
 
@@ -91,6 +91,32 @@
 
 ## 作業ログ
 
+### 2026-04-23 (セッション3: v0.15.0 CONDSTORE 同期)
+
+**実施内容:**
+- 他 IMAP クライアントでの既読化・削除が反映されない問題を修正
+- `imap-sync` に reconcile フェーズを追加:
+  - CONDSTORE `CHANGEDSINCE` で前回以降にフラグが変わった UID だけを差分取得 → `server_seen` 更新
+  - `SEARCH ALL` の結果と DB UID を突合 → DB にあって server に無い UID を `server_deleted_at` でマーク（1 回 200 件上限）
+  - `mail.folders.highest_modseq` を次回起点として保存
+- UI: スレッド一覧・詳細から `server_deleted_at IS NOT NULL` を除外、未読判定は `server_seen = true` も既読扱い、live メッセージ 0 件のスレッドは非表示
+- dev → main merge 済み
+
+**バージョン:** `v0.15.0`
+
+**コミット:**
+- `5bac792` feat: [dev] CONDSTORE による既読・削除の双方向同期 (v0.15.0)
+
+**残作業（次セッションへ）:**
+- **本番デプロイ**: Supabase SQL Editor で `20260423000002_imap_sync_state.sql` 適用 → `supabase functions deploy imap-sync`
+- 逆方向 `\Seen` 同期（taskul-mail 側で既読化時にサーバへ STORE）
+- IDLE worker で FETCH レスポンス（フラグ変更）をハンドルして準リアルタイム反映
+- QRESYNC `VANISHED` 活用（今は UID diff 代用）
+- Sent/Archive フォルダ同期の本体（多フォルダ対応）
+- Cloudflare Pages カスタムドメイン設定の確認
+
+---
+
 ### 2026-04-23 (セッション2: v0.14.0 リリース)
 
 **実施内容:**
@@ -118,17 +144,6 @@
 - 既存メッセージのスレッド再集約関数
 
 ---
-
-### 2026-04-23 (セッション1: v0.13.x)
-
-**実施内容:**
-- Realtime 購読拡張 (`message_reads` / `drafts` / `threads UPDATE`)、タブ未読バッジ追加
-- `mail.folders` テーブル新設 + `messages.folder_id` 追加（Sent/Archive 対応の土台）
-- インボックス UI 微調整: 削除ダイアログ廃止、3 カラム幅ドラッグ調整、返信/Claude 行も sticky、社内メモはメモ有り時のみ表示 + 返信行にメモボタン
-- VPS IDLE worker 実装（Node.js + imapflow + Docker Compose）— 本番稼働開始、新着レイテンシ 3 秒以下
-- スレッド集約フォールバック窓を 14 日 → 72 時間に短縮
-
-**バージョン:** `v0.13.1`
 
 ## テストチェックリスト
 
