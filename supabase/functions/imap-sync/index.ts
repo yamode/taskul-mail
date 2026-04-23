@@ -93,6 +93,19 @@ async function syncOneAccount(
     (e as { diag?: unknown }).diag = diag;
     throw e;
   }
+
+  // INBOX フォルダ id (messages.folder_id を正しくセットするため必須。
+  // migration 013 以降、unique index は (account_id, folder_id, imap_uid) の
+  // 部分インデックスに変わっているので onConflict も合わせる必要がある)
+  const { data: inboxFolder } = await sb
+    .from("folders")
+    .select("id")
+    .eq("account_id", account.id)
+    .eq("role", "inbox")
+    .maybeSingle();
+  const inboxFolderId = (inboxFolder as { id?: string } | null)?.id ?? null;
+  diag.inbox_folder_id = inboxFolderId;
+
   const lock = await client.getMailboxLock("INBOX");
 
   try {
@@ -484,10 +497,11 @@ async function syncOneAccount(
         }
       }
 
-      // メッセージ insert (重複は account_id+imap_uid の unique で弾く)
+      // メッセージ upsert (重複は (account_id, folder_id, imap_uid) の unique 制約で弾く)
       const { data: upsertedMsg, error: mErr } = await sb.from("messages").upsert(
         {
           account_id: account.id,
+          folder_id: inboxFolderId,
           thread_id: threadId,
           imap_uid: Number(msg.uid),
           message_id: messageId,
@@ -506,7 +520,7 @@ async function syncOneAccount(
           direction: "inbound",
           raw_headers: {},
         },
-        { onConflict: "account_id,imap_uid" },
+        { onConflict: "account_id,folder_id,imap_uid" },
       ).select("id").single();
       if (mErr) {
         console.error(`[${account.email_address}] message insert failed uid=${msg.uid}`, mErr);
