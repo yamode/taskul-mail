@@ -14,15 +14,14 @@ import { handlePreflight, jsonResponse, corsHeaders } from "../_shared/cors.ts";
 const MODEL = "claude-sonnet-4-5-20250929";
 
 const SYSTEM_PROMPT = `あなたは日本のビジネスメール作成を補助するアシスタントです。
-以下のルールで返信下書きを生成してください。
+以下のルールで返信下書きの本文を生成してください。
 
 - 日本語のビジネスメールとして自然で丁寧な文体
 - 冒頭の挨拶 (「お世話になっております」等)、署名プレースホルダ ([あなたの氏名]) を含める
 - 本文の主題に対して具体的に応答する。情報不足で推測が必要な箇所は [要確認: xxx] の形で明記
 - 送信者が不明確な場合は「ご担当者様」とする
 - 下書きなので、断定的な約束は避け、編集の余地を残す
-- 返答は JSON 一つのみ。前置き・マークダウン・コードフェンス一切なし
-- スキーマ: { "subject": string, "body_text": string }`;
+- 出力は返信メール本文のみ。件名・前置き・マークダウン・コードフェンス一切不要。本文テキストをそのまま出力する。`;
 
 type Msg = {
   id: string;
@@ -224,26 +223,13 @@ Deno.serve(async (req) => {
       apiKey: Deno.env.get("ANTHROPIC_API_KEY")!,
     });
 
-    const resp = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 2000,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userPrompt }],
-    });
+    // 件名は決定論的に算出 (Re: をすでに含むならそのまま、無ければ付与)
+    const origSubject = (target.subject ?? "").trim();
+    const subject = /^\s*re\s*:/i.test(origSubject)
+      ? origSubject
+      : `Re: ${origSubject}`;
 
-    const rawText = resp.content
-      .filter((b) => b.type === "text")
-      .map((b) => (b as { text: string }).text)
-      .join("");
-
-    // コードフェンス混入対策 (```json / ``` どちらも剥がす)
-    const jsonText = rawText
-      .replace(/^\s*```(?:json)?\s*/i, "")
-      .replace(/\s*```\s*$/i, "")
-      .trim();
-    const parsed = JSON.parse(jsonText) as { subject: string; body_text: string };
-
-    // 下書き保存
+    // 空本文で下書きを先に作成 → id をクライアントにメタ通知 → ストリームで本文を流す
     const { data: draft, error: dErr } = await sb
       .from("drafts")
       .insert({
@@ -253,21 +239,72 @@ Deno.serve(async (req) => {
         thread_id: target.thread_id,
         to_addresses: target.from_address ? [target.from_address] : [],
         cc_addresses: [],
-        subject: parsed.subject,
-        body_text: parsed.body_text,
-        ai_original_body: parsed.body_text,
+        subject,
+        body_text: "",
+        ai_original_body: "",
         generated_by_ai: true,
         ai_prompt_hint: recordedHint,
         status: "draft",
       })
-      .select("id,subject,body_text")
+      .select("id")
       .single();
     if (dErr) throw dErr;
+    const draftId = draft!.id as string;
 
-    return jsonResponse(req, {
-      draft_id: draft!.id,
-      subject: draft!.subject,
-      body_text: draft!.body_text,
+    const encoder = new TextEncoder();
+    const sseEvent = (event: string, data: unknown) =>
+      encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          controller.enqueue(sseEvent("meta", { draft_id: draftId, subject }));
+
+          let full = "";
+          const s = anthropic.messages.stream({
+            model: MODEL,
+            max_tokens: 2000,
+            system: SYSTEM_PROMPT,
+            messages: [{ role: "user", content: userPrompt }],
+          });
+          for await (const chunk of s) {
+            if (
+              chunk.type === "content_block_delta" &&
+              chunk.delta.type === "text_delta"
+            ) {
+              const delta = chunk.delta.text;
+              if (delta) {
+                full += delta;
+                controller.enqueue(sseEvent("text", { delta }));
+              }
+            }
+          }
+
+          // 下書き本体を最終本文で更新
+          await sb
+            .from("drafts")
+            .update({ body_text: full, ai_original_body: full })
+            .eq("id", draftId);
+
+          controller.enqueue(sseEvent("done", { body_text: full }));
+        } catch (e) {
+          controller.enqueue(
+            sseEvent("error", { message: (e as Error).message }),
+          );
+        } finally {
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        "x-accel-buffering": "no",
+        ...corsHeaders(req),
+      },
     });
   } catch (e) {
     return jsonResponse(req, { error: (e as Error).message }, 400);

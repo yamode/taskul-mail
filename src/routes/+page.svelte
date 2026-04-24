@@ -783,10 +783,14 @@
   }
 
   async function applyThreads(rows: any[]) {
-    let base: Thread[] = rows.map((t: any) => ({
-      ...t,
-      account_label: t.accounts?.label,
-    }));
+    // 楽観削除済み ID は、先行中の loadThreads が古い結果を返しても復活させない
+    const deletedSet = new Set(recentlyDeletedIds);
+    let base: Thread[] = rows
+      .filter((t: any) => !deletedSet.has(t.id))
+      .map((t: any) => ({
+        ...t,
+        account_label: t.accounts?.label,
+      }));
 
     const perAccount = new Map<string, number>();
     if (base.length > 0 && userId) {
@@ -1154,6 +1158,9 @@
       }
     }
     threads = threads.filter((x) => x.id !== id);
+    // 先行中の loadThreads が古い結果で復活させないよう、楽観削除と同時に記録。
+    // (applyThreads でこの集合をフィルタして除外する)
+    recentlyDeletedIds = [...recentlyDeletedIds, id];
     if (wasSelected) {
       if (nextToOpen) {
         await openThread(nextToOpen);
@@ -1170,9 +1177,9 @@
     if (error) {
       alert(`削除失敗: ${error.message}\n(migration 20260422000007 を SQL Editor で適用してください)`);
       threads = prev;
+      recentlyDeletedIds = recentlyDeletedIds.filter((x) => x !== id);
       return;
     }
-    recentlyDeletedIds = [...recentlyDeletedIds, id];
     if (undoToastTimer) clearTimeout(undoToastTimer);
     undoToastTimer = setTimeout(() => {
       const toCommit = recentlyDeletedIds;
@@ -1410,25 +1417,68 @@
         headers: { "content-type": "application/json", ...(await authHeader()) },
         body: JSON.stringify({ message_id: selectedMessageId, hint: hint || undefined }),
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "failed");
-      // AI 下書きは返信モードとして inline 展開する
+      if (!res.ok || !res.body) {
+        // エラー時は JSON で { error } が返る想定
+        let msg = `HTTP ${res.status}`;
+        try { const j = await res.json(); if (j?.error) msg = j.error; } catch {}
+        throw new Error(msg);
+      }
+
       const src = messages.find((m) => m.id === selectedMessageId);
       const quotedBody = src ? buildQuoted(src) : "";
-      compose = {
-        id: json.draft_id,
-        mode: "reply",
-        sourceMessageId: selectedMessageId!,
-        subject: json.subject ?? "",
-        to: src?.from_address ? [src.from_address] : [],
-        cc: [],
-        userBody: json.body_text ?? "",
-        quotedBody,
-        showQuoted: false,
-        aiOriginalBody: json.body_text ?? "",
-        feedbackRating: null,
-        feedbackComment: "",
+      const savedMessageId = selectedMessageId;
+      let fullBody = "";
+
+      // SSE ストリーム: 行単位で読み出し、event: / data: ペアを解釈
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      const handle = (event: string, data: string) => {
+        let payload: any = null;
+        try { payload = JSON.parse(data); } catch { return; }
+        if (event === "meta") {
+          compose = {
+            id: payload.draft_id,
+            mode: "reply",
+            sourceMessageId: savedMessageId!,
+            subject: payload.subject ?? "",
+            to: src?.from_address ? [src.from_address] : [],
+            cc: [],
+            userBody: "",
+            quotedBody,
+            showQuoted: false,
+            aiOriginalBody: "",
+            feedbackRating: null,
+            feedbackComment: "",
+          };
+        } else if (event === "text" && compose) {
+          fullBody += payload.delta ?? "";
+          compose = { ...compose, userBody: fullBody };
+        } else if (event === "done" && compose) {
+          compose = { ...compose, userBody: fullBody, aiOriginalBody: fullBody };
+        } else if (event === "error") {
+          throw new Error(payload?.message || "stream error");
+        }
       };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          let event = "message";
+          const dataLines: string[] = [];
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+          }
+          if (dataLines.length > 0) handle(event, dataLines.join("\n"));
+        }
+      }
     } catch (e) {
       alert(`下書き生成失敗: ${(e as Error).message}`);
     } finally {
